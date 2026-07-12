@@ -1,0 +1,20 @@
+# Sample rule detecting encoded PowerShell execution against winlogbeat-* data; rule_id must stay stable once created.
+rule_id: lab-win-encoded-powershell
+name: "PowerShell EncodedCommand Execution"
+description: >-
+  Detects powershell.exe launched with an encoded command argument, a common
+  defense-evasion pattern for staging obfuscated payloads.
+type: query
+language: kuery
+index:
+  - "winlogbeat-*"
+query: 'process.name : "powershell.exe" and process.args : ("-enc" or "-EncodedCommand" or "-e")'
+risk_score: 47
+severity: medium
+enabled: true
+interval: 5m
+from: now-6m
+tags:
+  - lab
+  - windows
+  - defense-evasion
