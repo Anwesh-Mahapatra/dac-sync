@@ -1,0 +1,167 @@
+# ============================================================================
+# Detection-as-Code Lab Stack: Elasticsearch + Kibana + Cribl Stream
+# Security ENABLED: basic auth over plain HTTP. Zero TLS certs to generate.
+# Hard memory ceiling: 10 GB (ES 6G / Kibana 2G / Cribl 2G). Idle ~7-8 GB.
+#
+# ML enabled: xpack.ml.enabled=true + xpack.license.self_generated.type=trial.
+# Both are required for Kibana's "Rule Monitoring Overview" graph
+# (categorize_text aggregation) -- ml.enabled alone is not enough, that agg
+# is license-gated to Platinum/Enterprise/Trial, not Basic. The self-generated
+# trial license runs 30 days; re-issue by clearing ES's license state if it
+# lapses on a long-lived lab.
+#
+# Secrets: all passwords/keys come from a local .env file (gitignored).
+# Copy .env.example -> .env and fill in real values before first run.
+#
+# LAB CREDS (rotate if this ever leaves an isolated network):
+#   Elasticsearch/Kibana login: elastic / <ELASTIC_PASSWORD from .env>
+#   Cribl UI:                   admin / admin (forced change on first login)
+# ============================================================================
+
+name: dac-lab
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.4.3
+    container_name: elasticsearch
+    restart: unless-stopped
+    environment:
+      - node.name=es01
+      - cluster.name=dac-lab
+      - discovery.type=single-node
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=false       # auth over plain HTTP
+      - xpack.security.transport.ssl.enabled=false  # single node; the WARN this logs is non-fatal
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}         # bootstrap password for the 'elastic' user
+      - xpack.ml.enabled=true                        # required for Rule Monitoring Overview (categorize_text_agg)
+      - xpack.license.self_generated.type=trial       # Basic license does not cover categorize_text_agg
+      - bootstrap.memory_lock=true
+      - ES_JAVA_OPTS=-Xms3g -Xmx3g                   # keep <= 50% of mem_limit
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    mem_limit: 6g
+    cpus: 4
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    healthcheck:
+      # Security is on -> healthcheck must authenticate or ES returns 401
+      test: ["CMD-SHELL", "curl -sf -u elastic:$$ELASTIC_PASSWORD http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    logging: *default-logging
+    networks: [dac]
+
+  # One-shot: sets the kibana_system password once ES is healthy, then exits 0.
+  # Kibana is not allowed to connect as the 'elastic' superuser, and the
+  # kibana_system account ships with no password -- this breaks the chicken/egg.
+  # Idempotent: safe to re-run on every 'docker compose up'.
+  es-setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.4.3
+    container_name: es-setup
+    restart: "no"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - KIBANA_SYSTEM_PASSWORD=${KIBANA_SYSTEM_PASSWORD}
+    command:
+      - bash
+      - -c
+      # NOTE: literal block (|) preserves newlines -> real multi-line script.
+      # '$$' is required: Compose interpolates single '$' before bash sees it.
+      - |
+        for i in $$(seq 1 60); do
+          if curl -sf -o /dev/null -u elastic:$$ELASTIC_PASSWORD -X POST \
+               -H 'Content-Type: application/json' \
+               http://elasticsearch:9200/_security/user/kibana_system/_password \
+               -d "{\"password\":\"$$KIBANA_SYSTEM_PASSWORD\"}"; then
+            echo "kibana_system password set"
+            exit 0
+          fi
+          sleep 2
+        done
+        echo "FAILED to set kibana_system password after 120s" >&2
+        exit 1
+    logging: *default-logging
+    networks: [dac]
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:9.4.3
+    container_name: kibana
+    restart: unless-stopped
+    depends_on:
+      es-setup:
+        condition: service_completed_successfully
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=${KIBANA_SYSTEM_PASSWORD}
+      # Required for Detection Rules / Alerting to survive restarts. 32+ chars.
+      # Sourced from .env -- generate real ones with `openssl rand -hex 32`.
+      - XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY=${KIBANA_ENCRYPTEDSAVEDOBJECTS_KEY}
+      - XPACK_SECURITY_ENCRYPTIONKEY=${KIBANA_SECURITY_ENCRYPTIONKEY}
+      - XPACK_REPORTING_ENCRYPTIONKEY=${KIBANA_REPORTING_ENCRYPTIONKEY}
+      - NODE_OPTIONS=--max-old-space-size=1400
+    mem_limit: 2g          # bumped from 1.5g: installing prebuilt detection rules spikes memory
+    cpus: 2
+    ports:
+      - "5601:5601"
+    healthcheck:
+      # Credential-free check: Kibana redirects / -> /login (302) once it's up
+      test: ["CMD-SHELL", "curl -s -I http://localhost:5601 | grep -q 'HTTP/1.1 302 Found'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 90s
+    logging: *default-logging
+    networks: [dac]
+
+  cribl:
+    # Cribl publishes 'latest' as the current stable release; pin a numbered
+    # tag if you want reproducible rebuilds.
+    image: cribl/cribl:latest
+    container_name: cribl
+    restart: unless-stopped
+    environment:
+      - CRIBL_VOLUME_DIR=/opt/cribl/config-volume
+      # CRITICAL on a 32-thread host: default worker count = (cores - 2),
+      # i.e. ~30 Node.js processes. Cap it or Cribl alone eats the box.
+      - CRIBL_MAX_WORKERS=2
+    mem_limit: 2g
+    cpus: 3
+    volumes:
+      - cribl-config:/opt/cribl/config-volume
+    ports:
+      - "9000:9000"        # Cribl UI/API
+      - "9514:9514/tcp"    # default syslog Source
+      - "9514:9514/udp"
+      - "9201:9201"        # e.g. Cribl Elastic API Source (agents point here, not at real ES)
+      # - "8088:8088"      # Splunk HEC Source (uncomment if used)
+      # - "10080:10080"    # Cribl HTTP Source (uncomment if used)
+    logging: *default-logging
+    networks: [dac]
+
+networks:
+  dac:
+    driver: bridge
+
+volumes:
+  esdata:
+  cribl-config:
