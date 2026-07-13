@@ -1,3 +1,6 @@
 /dac-sync
 .env
 /eforge/output/
+# ECS reference clone, consulted at dev time only. NOT under ./vendor -- that
+# path is reserved by Go module vendoring and a dir there breaks `go build`.
+third_party/ecs/
