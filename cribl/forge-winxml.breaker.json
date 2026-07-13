@@ -1,0 +1,19 @@
+{
+  "id": "forge-winxml",
+  "minRawLength": 256,
+  "description": "Breaks a concatenated EvidenceForge Windows Event XML file (<Events>...<Event/>...</Events>) into one raw chunk per <Event> element. Uses a zero-width lookahead so the <Event tag is preserved as part of each chunk instead of being consumed as a delimiter. Matches '<Event ' or '<Event>' but not the '<Events>' wrapper tag.",
+  "rules": [
+    {
+      "name": "forge-winxml",
+      "condition": "true",
+      "type": "regex",
+      "eventBreakerRegex": "/(?=<Event[ >])/",
+      "maxEventBytes": 131072,
+      "timestampAnchorRegex": "/^/",
+      "timestamp": {
+        "type": "current"
+      },
+      "timestampTimezone": "UTC"
+    }
+  ]
+}

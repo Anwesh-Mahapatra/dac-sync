@@ -148,6 +148,10 @@ services:
     cpus: 3
     volumes:
       - cribl-config:/opt/cribl/config-volume
+      # EvidenceForge synthetic dataset output -- read-only, static batch
+      # data for the Filesystem Collector (Full Run replay), not a tailed
+      # Source. Regenerate on the host; Cribl just needs to see the files.
+      - ./eforge/output/data:/data/eforge:ro
     ports:
       - "9000:9000"        # Cribl UI/API
       - "9514:9514/tcp"    # default syslog Source

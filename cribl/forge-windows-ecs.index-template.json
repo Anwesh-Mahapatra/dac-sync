@@ -1,0 +1,105 @@
+{
+  "index_patterns": ["forge-windows-ecs*"],
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0
+    },
+    "mappings": {
+      "dynamic_templates": [
+        {
+          "winlog_event_data_strings": {
+            "path_match": "winlog.event_data.*",
+            "match_mapping_type": "string",
+            "mapping": {
+              "type": "text",
+              "fields": {
+                "keyword": {
+                  "type": "keyword",
+                  "ignore_above": 32766
+                }
+              }
+            }
+          }
+        }
+      ],
+      "properties": {
+        "@timestamp": { "type": "date" },
+        "event": {
+          "properties": {
+            "code": { "type": "keyword" },
+            "provider": { "type": "keyword" },
+            "outcome": { "type": "keyword" }
+          }
+        },
+        "host": {
+          "properties": {
+            "name": { "type": "keyword" }
+          }
+        },
+        "process": {
+          "properties": {
+            "pid": { "type": "long" },
+            "name": { "type": "keyword" },
+            "executable": { "type": "keyword" },
+            "command_line": {
+              "type": "text",
+              "fields": {
+                "keyword": { "type": "keyword", "ignore_above": 32766 }
+              }
+            },
+            "args": { "type": "keyword" },
+            "parent": {
+              "properties": {
+                "pid": { "type": "long" },
+                "name": { "type": "keyword" },
+                "executable": { "type": "keyword" }
+              }
+            }
+          }
+        },
+        "user": {
+          "properties": {
+            "name": { "type": "keyword" },
+            "domain": { "type": "keyword" },
+            "id": { "type": "keyword" }
+          }
+        },
+        "source": {
+          "properties": {
+            "ip": { "type": "ip" },
+            "port": { "type": "long" }
+          }
+        },
+        "destination": {
+          "properties": {
+            "domain": { "type": "keyword" },
+            "address": { "type": "keyword" }
+          }
+        },
+        "winlog": {
+          "properties": {
+            "event_id": { "type": "long" },
+            "channel": { "type": "keyword" },
+            "computer_name": { "type": "keyword" },
+            "record_id": { "type": "keyword" },
+            "logon": {
+              "properties": {
+                "type": { "type": "keyword" }
+              }
+            }
+          }
+        },
+        "log": {
+          "properties": {
+            "file": {
+              "properties": {
+                "path": { "type": "keyword" }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
