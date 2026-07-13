@@ -20,7 +20,7 @@ why the two indices differ (the live Winlogbeat route has no pipeline).
 
 This table documents the normalization the Cribl pipeline (`cribl/winxml_to_ecs.js`)
 performs. The **ECS type** column is verified against
-`vendor/ecs/generated/ecs/ecs_flat.yml` at ECS **v8.0.0** (pinned to the
+`third_party/ecs/generated/ecs/ecs_flat.yml` at ECS **v8.0.0** (pinned to the
 `ecs.version` in the data). Every target below exists in that file with the type
 shown.
 
