@@ -1,15 +1,39 @@
-# Sample rule detecting encoded PowerShell execution against winlogbeat-* data; rule_id must stay stable once created.
+# Detects encoded PowerShell execution against the ECS-normalized forge-windows-ecs
+# index. rule_id must stay stable once created.
+#
+# Field contract: see SCHEMA.md. This rule queries ECS process.* fields, which
+# exist in forge-windows-ecs* (proven via _field_caps). It intentionally does NOT
+# query winlogbeat-*: that index carries no process.* (raw winlog.event_data.*
+# only) and truncates CommandLine at ignore_above:256, which is exactly the P3
+# bug that hid long -enc payloads.
 rule_id: lab-win-encoded-powershell
 name: "PowerShell EncodedCommand Execution"
 description: >-
-  Detects powershell.exe launched with an encoded command argument, a common
-  defense-evasion pattern for staging obfuscated payloads.
+  Detects powershell.exe launched with an encoded command argument (-enc /
+  -EncodedCommand) or an inline FromBase64String decode, a common
+  defense-evasion pattern for staging obfuscated payloads. Matches on the
+  analyzed process.command_line.text multi-field so long payloads are never
+  truncated and matching is case-insensitive.
 type: query
 language: kuery
 index:
-  - "winlogbeat-*"
-  - "forge-*"
-query: '(winlog.event_data.OriginalFileName: "PowerShell.EXE" or winlog.event_data.NewProcessName.keyword: *powershell.exe) and (winlog.event_data.CommandLine.keyword: *-enc* or winlog.event_data.CommandLine.keyword: *-EncodedCommand* or winlog.event_data.CommandLine.keyword: *-e*)'
+  - "forge-windows-ecs*"
+# Why .text and not the raw wildcard field:
+#   - process.command_line is type `wildcard` (no length cap), so the payload is
+#     stored in full -- but wildcard matching is CASE-SENSITIVE in KQL, so
+#     `*-enc*` would miss `-EncodedCommand`.
+#   - process.command_line.text (match_only_text) is analyzed + case-insensitive,
+#     and "-enc" tokenizes to "enc", "-EncodedCommand" to "encodedcommand", so a
+#     token match catches every case variant regardless of payload length.
+# Gated on ECS event.category/event.type (process/start) rather than on
+# event.action or winlog.task, whose text labels are unreliable (P2).
+query: >-
+  (event.category: "process" and event.type: "start") and
+  (process.name: "powershell.exe" or process.name: "pwsh.exe" or
+   process.pe.original_file_name: "PowerShell.EXE") and
+  (process.command_line.text: "enc" or
+   process.command_line.text: "encodedcommand" or
+   process.command_line.text: "frombase64string")
 risk_score: 47
 severity: medium
 enabled: true
