@@ -1,0 +1,18 @@
+{
+  "id": "strip_cribl_internal",
+  "conf": {
+    "functions": [
+      {
+        "id": "eval",
+        "filter": "true",
+        "conf": {
+          "remove": [
+            "_time",
+            "filter_path"
+          ]
+        },
+        "description": "P4: remove Cribl internals before the Elastic destination. `_time` is Cribl's own epoch bookkeeping field and must not land in _source (Elastic already gets @timestamp). `filter_path` is an ES _bulk *query-string* param (errors,items.*.error,...) that the Elastic destination injects via extraParams; it is NOT a document field and only appears in _source because the winlogbeat route ships raw events with no pipeline. Wire this pipeline (or just this Eval function) onto that route -- see cribl/README.md."
+      }
+    ]
+  }
+}
