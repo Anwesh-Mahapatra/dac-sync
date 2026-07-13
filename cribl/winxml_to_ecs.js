@@ -67,6 +67,60 @@ function splitArgs(cmdline) {
   return args;
 }
 
+// Sysmon writes a literal "-" for fields it has no value for (OriginalFileName,
+// FileVersion, Hashes on an unsigned binary, ...). Treat it as absent so we
+// don't index "-" as if it were a real process name or hash.
+function sysmonVal(v) {
+  if (v == null) return undefined;
+  if (v === '' || v === '-') return undefined;
+  return v;
+}
+
+// Sysmon's User is "DOMAIN\user" (e.g. "CORP\attacker"). Security events carry
+// the domain and user in separate <Data> elements, so this split is Sysmon-only.
+function splitDomainUser(v) {
+  var s = sysmonVal(v);
+  if (!s) return undefined;
+  var i = s.indexOf('\\');
+  if (i < 0) return { name: s };
+  return { domain: s.slice(0, i), name: s.slice(i + 1) };
+}
+
+// Sysmon's Hashes is a flat CSV of ALGO=hex pairs, e.g.
+// "SHA1=A1B2...,MD5=C3D4...,SHA256=E5F6...,IMPHASH=0011...". ECS wants them
+// under process.hash.<algo> (lowercased); IMPHASH belongs to process.pe.imphash.
+function parseHashes(v) {
+  var s = sysmonVal(v);
+  if (!s) return undefined;
+  var out = {};
+  var parts = s.split(',');
+  for (var i = 0; i < parts.length; i++) {
+    var kv = parts[i].split('=');
+    if (kv.length !== 2) continue;
+    var algo = kv[0].trim().toLowerCase();
+    var val = kv[1].trim();
+    if (val) out[algo] = val;
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+// Builds the ECS process.* object shared by every Sysmon event that names an
+// Image. Sysmon ProcessId is already decimal (Security's is hex) -- hexToDecimal
+// handles both.
+function sysmonProcess(eventData) {
+  var proc = {};
+  var image = sysmonVal(eventData.Image);
+  if (image) {
+    proc.executable = image;
+    proc.name = basename(image);
+  }
+  var pid = hexToDecimal(sysmonVal(eventData.ProcessId));
+  if (pid !== undefined) proc.pid = pid;
+  var guid = sysmonVal(eventData.ProcessGuid);
+  if (guid) proc.entity_id = guid;
+  return proc;
+}
+
 function extractEventData(xml) {
   var data = {};
   var re = /<Data Name="([^"]+)">([\s\S]*?)<\/Data>/g;
@@ -144,7 +198,120 @@ function applyToEvent(__e) {
   __e.log.file.path = __e.source;
   delete __e.source;
 
+  // Sysmon EIDs (1, 3, 11, ...) are small integers that collide with EIDs on
+  // other channels (System EID 1 is not a process creation). Only treat them as
+  // Sysmon when the provider says so.
+  var isSysmon = !!providerMatch && providerMatch[1].indexOf('Sysmon') >= 0;
+
   switch (eventId) {
+    case '1': { // Sysmon: process creation
+      if (isSysmon) {
+        var sProc = sysmonProcess(eventData);
+        sProc.command_line = sysmonVal(eventData.CommandLine);
+        sProc.args = splitArgs(sysmonVal(eventData.CommandLine));
+        sProc.working_directory = sysmonVal(eventData.CurrentDirectory);
+
+        var origName = sysmonVal(eventData.OriginalFileName);
+        var product = sysmonVal(eventData.Product);
+        var company = sysmonVal(eventData.Company);
+        var fileVer = sysmonVal(eventData.FileVersion);
+        var descr = sysmonVal(eventData.Description);
+        var hashes = parseHashes(eventData.Hashes);
+        // OriginalFileName is the name compiled into the PE header -- it does not
+        // change when the file on disk is renamed, so it is the rename-evasion
+        // signal. ECS files it under process.pe.original_file_name.
+        if (origName || product || company || fileVer || descr) {
+          sProc.pe = {};
+          if (origName) sProc.pe.original_file_name = origName;
+          if (product) sProc.pe.product = product;
+          if (company) sProc.pe.company = company;
+          if (fileVer) sProc.pe.file_version = fileVer;
+          if (descr) sProc.pe.description = descr;
+        }
+        if (hashes) {
+          if (hashes.imphash) {
+            sProc.pe = sProc.pe || {};
+            sProc.pe.imphash = hashes.imphash;
+            delete hashes.imphash;
+          }
+          if (Object.keys(hashes).length) sProc.hash = hashes;
+        }
+
+        var pImage = sysmonVal(eventData.ParentImage);
+        var pCmd = sysmonVal(eventData.ParentCommandLine);
+        var pPid = hexToDecimal(sysmonVal(eventData.ParentProcessId));
+        var pGuid = sysmonVal(eventData.ParentProcessGuid);
+        if (pImage || pCmd || pPid !== undefined || pGuid) {
+          sProc.parent = {};
+          if (pImage) {
+            sProc.parent.executable = pImage;
+            sProc.parent.name = basename(pImage);
+          }
+          if (pCmd) {
+            sProc.parent.command_line = pCmd;
+            sProc.parent.args = splitArgs(pCmd);
+          }
+          if (pPid !== undefined) sProc.parent.pid = pPid;
+          if (pGuid) sProc.parent.entity_id = pGuid;
+        }
+
+        __e.process = sProc;
+        var sUser = splitDomainUser(eventData.User);
+        if (sUser) __e.user = sUser;
+        __e.event.category = ['process'];
+        __e.event.type = ['start'];
+      }
+      break;
+    }
+    case '3': { // Sysmon: network connection
+      if (isSysmon) {
+        __e.process = sysmonProcess(eventData);
+        var nUser = splitDomainUser(eventData.User);
+        if (nUser) __e.user = nUser;
+
+        var srcIp = sysmonVal(eventData.SourceIp);
+        if (srcIp) {
+          __e.source = { ip: stripIpv4Mapped(srcIp) };
+          var srcPort = parseInt(sysmonVal(eventData.SourcePort), 10);
+          if (!isNaN(srcPort)) __e.source.port = srcPort;
+        }
+        var dstIp = sysmonVal(eventData.DestinationIp);
+        if (dstIp) {
+          __e.destination = { ip: stripIpv4Mapped(dstIp) };
+          var dstPort = parseInt(sysmonVal(eventData.DestinationPort), 10);
+          if (!isNaN(dstPort)) __e.destination.port = dstPort;
+        }
+        // DestinationHostname is a resolved name, which is ECS destination.domain.
+        var dstHost = sysmonVal(eventData.DestinationHostname);
+        if (dstHost) {
+          __e.destination = __e.destination || {};
+          __e.destination.domain = dstHost;
+        }
+        var proto = sysmonVal(eventData.Protocol);
+        if (proto) __e.network = { transport: proto.toLowerCase() };
+
+        __e.event.category = ['network'];
+        __e.event.type = ['connection'];
+      }
+      break;
+    }
+    case '11': { // Sysmon: file created
+      if (isSysmon) {
+        __e.process = sysmonProcess(eventData);
+        var fUser = splitDomainUser(eventData.User);
+        if (fUser) __e.user = fUser;
+
+        var target = sysmonVal(eventData.TargetFilename);
+        if (target) {
+          __e.file = { path: target, name: basename(target) };
+          var sep = Math.max(target.lastIndexOf('\\'), target.lastIndexOf('/'));
+          if (sep > 0) __e.file.directory = target.slice(0, sep);
+        }
+        __e.event.category = ['file'];
+        __e.event.type = ['creation'];
+      }
+      break;
+    }
     case '4688': { // process creation
       var proc = {
         pid: hexToDecimal(eventData.NewProcessId),
@@ -166,6 +333,8 @@ function applyToEvent(__e) {
         domain: eventData.SubjectDomainName,
         id: eventData.SubjectUserSid
       };
+      __e.event.category = ['process'];
+      __e.event.type = ['start'];
       break;
     }
     case '4624': // successful logon
@@ -176,6 +345,8 @@ function applyToEvent(__e) {
         id: eventData.TargetUserSid
       };
       __e.event.outcome = (eventId === '4624') ? 'success' : 'failure';
+      __e.event.category = ['authentication'];
+      __e.event.type = ['start'];
       __e.winlog.logon = { type: eventData.LogonType };
       if (eventData.IpAddress && eventData.IpAddress !== '-') {
         __e.source = { ip: stripIpv4Mapped(eventData.IpAddress) };
@@ -206,6 +377,8 @@ function applyToEvent(__e) {
           __e.source.port = parseInt(eventData.IpPort, 10);
         }
       }
+      __e.event.category = ['authentication'];
+      __e.event.type = ['start'];
       break;
     }
     default:
@@ -223,7 +396,11 @@ module.exports = {
   hexToDecimal: hexToDecimal,
   basename: basename,
   unescapeXml: unescapeXml,
-  extractEventData: extractEventData
+  extractEventData: extractEventData,
+  sysmonVal: sysmonVal,
+  splitDomainUser: splitDomainUser,
+  parseHashes: parseHashes,
+  sysmonProcess: sysmonProcess
 };
 
 if (require.main === module) {
@@ -480,6 +657,180 @@ if (require.main === module) {
     applyToEvent(e);
     assert.strictEqual(e.winlog.event_data.TargetUserSid, 'S-1-5-21-2684217973-1604675485-2509691772-1003');
     assert.strictEqual(e.winlog.event_data.IpAddress, '::ffff:203.0.113.50', 'raw winlog.event_data.IpAddress keeps the original unstripped value');
+  });
+
+  // --- Sysmon (verbatim from eforge/output/data/*/windows_event_sysmon.xml) ---
+
+  function sysmonEvent(eventId, task, body) {
+    return '<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">\n' +
+      '  <System>\n' +
+      '    <Provider Name="Microsoft-Windows-Sysmon" Guid="{5770385f-c22a-43e0-bf4c-06f5698ffbd9}"/>\n' +
+      '    <EventID>' + eventId + '</EventID>\n' +
+      '    <Task>' + task + '</Task>\n' +
+      '    <TimeCreated SystemTime="2026-07-13T05:40:59.6382827Z"/>\n' +
+      '    <EventRecordID>451415</EventRecordID>\n' +
+      '    <Channel>Microsoft-Windows-Sysmon/Operational</Channel>\n' +
+      '    <Computer>WS-EXEC-01.corp.example.com</Computer>\n' +
+      '  </System>\n' +
+      '  <EventData>\n' + body + '  </EventData>\n' +
+      '</Event>\n';
+  }
+
+  var SAMPLE_SYSMON_1_MIMIKATZ = sysmonEvent(1, 1,
+    '    <Data Name="ProcessGuid">{f6ab85b5-7a6b-6a54-9d02-001080f67d88}</Data>\n' +
+    '    <Data Name="ProcessId">7372</Data>\n' +
+    '    <Data Name="Image">C:\\Windows\\Temp\\mimikatz.exe</Data>\n' +
+    '    <Data Name="OriginalFileName">-</Data>\n' +
+    '    <Data Name="CommandLine">mimikatz.exe privilege::debug sekurlsa::logonpasswords exit</Data>\n' +
+    '    <Data Name="CurrentDirectory">C:\\Windows\\Temp\\</Data>\n' +
+    '    <Data Name="User">CORP\\attacker</Data>\n' +
+    '    <Data Name="Hashes">SHA1=80520C50C30D947A68E2E01E4B92DF5FF29928FA,MD5=D6395FA4C4ABC4A284744C04BC2C6207,SHA256=69D6A3AB75BCB21819F7D54E69E6BA2CB32C8E958F27473FD54099ADEB4BB353,IMPHASH=D775FDE08B202AEDA21B2DF864344D45</Data>\n' +
+    '    <Data Name="ParentProcessId">4820</Data>\n' +
+    '    <Data Name="ParentImage">C:\\Windows\\System32\\cmd.exe</Data>\n' +
+    '    <Data Name="ParentCommandLine">cmd.exe /c mimikatz.exe</Data>\n');
+
+  // The exact 388-char payload from GROUND_TRUTH -- the doc P3 says must never
+  // be silently dropped.
+  var ENC_PAYLOAD = 'powershell.exe -enc JABkAGMAID0AIAAoAFsAUwB5AHMAdABlAG0ALgBEAGkAcgBlAGMAdABvAHIAeQBTAGUAcgB2AGkAYwBlAHMALgBBAGMAdABpAHYAZQBEAGkAcgBlAGMAdABvAHIAeQBdADoAOgBHAGUAdABDAHUAcgByAGUAbgB0AEQAbwBtAGEAaQBuACkAKQA7ACAAJABkAGMALgBHAGUAdABEAGkAcgBlAGMAdABvAHIAeQBFAG4AdAByAHkAKAApAC4AQwBoAGkAbABkAHIAZQBuACAAfAAgAD8AewAkAF8ALgBTAGMAaABlAG0AYQBDAGwAYQBzAHMATgBhAG0AZQAgAC0AZQBxACAAJwB1AHMAZQByACcAfQA=';
+
+  var SAMPLE_SYSMON_1_ENCODED_PS = sysmonEvent(1, 1,
+    '    <Data Name="ProcessId">5768</Data>\n' +
+    '    <Data Name="Image">C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe</Data>\n' +
+    '    <Data Name="OriginalFileName">PowerShell.EXE</Data>\n' +
+    '    <Data Name="CommandLine">' + ENC_PAYLOAD + '</Data>\n' +
+    '    <Data Name="User">CORP\\attacker</Data>\n');
+
+  var SAMPLE_SYSMON_3 = sysmonEvent(3, 3,
+    '    <Data Name="ProcessId">3696</Data>\n' +
+    '    <Data Name="Image">C:\\Windows\\System32\\lsass.exe</Data>\n' +
+    '    <Data Name="User">NT AUTHORITY\\SYSTEM</Data>\n' +
+    '    <Data Name="Protocol">udp</Data>\n' +
+    '    <Data Name="SourceIp">10.0.10.50</Data>\n' +
+    '    <Data Name="SourcePort">49865</Data>\n' +
+    '    <Data Name="SourcePortName">-</Data>\n' +
+    '    <Data Name="DestinationIp">10.0.1.10</Data>\n' +
+    '    <Data Name="DestinationHostname">SRV-DC-01.corp.example.com</Data>\n' +
+    '    <Data Name="DestinationPort">88</Data>\n');
+
+  var SAMPLE_SYSMON_11 = sysmonEvent(11, 11,
+    '    <Data Name="ProcessId">5488</Data>\n' +
+    '    <Data Name="Image">C:\\Windows\\Temp\\KB5034441_update.exe</Data>\n' +
+    '    <Data Name="User">CORP\\jsmith</Data>\n' +
+    '    <Data Name="TargetFilename">C:\\Windows\\Temp\\MSI45070.tmp</Data>\n');
+
+  // Same EID as Sysmon process-create, different provider -- must NOT be mapped.
+  var SAMPLE_SYSTEM_EID1 =
+    '<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">\n' +
+    '  <System>\n' +
+    '    <Provider Name="Microsoft-Windows-Kernel-General"/>\n' +
+    '    <EventID>1</EventID>\n' +
+    '    <TimeCreated SystemTime="2026-07-13T05:40:59.0000000Z"/>\n' +
+    '    <Channel>System</Channel>\n' +
+    '    <Computer>WS-EXEC-01.corp.example.com</Computer>\n' +
+    '  </System>\n' +
+    '  <EventData><Data Name="Image">not-a-process-create</Data></EventData>\n' +
+    '</Event>\n';
+
+  test('Sysmon 1: Image/CommandLine/CurrentDirectory map to ECS process.*', function () {
+    var e = { _raw: SAMPLE_SYSMON_1_MIMIKATZ };
+    applyToEvent(e);
+    assert.strictEqual(e.process.executable, 'C:\\Windows\\Temp\\mimikatz.exe');
+    assert.strictEqual(e.process.name, 'mimikatz.exe');
+    assert.strictEqual(e.process.command_line, 'mimikatz.exe privilege::debug sekurlsa::logonpasswords exit');
+    assert.strictEqual(e.process.working_directory, 'C:\\Windows\\Temp\\');
+    assert.strictEqual(e.process.pid, 7372, 'Sysmon ProcessId is decimal, not hex');
+    assert.strictEqual(e.process.entity_id, '{f6ab85b5-7a6b-6a54-9d02-001080f67d88}');
+    assert.deepStrictEqual(e.process.args, ['mimikatz.exe', 'privilege::debug', 'sekurlsa::logonpasswords', 'exit']);
+  });
+
+  test('Sysmon 1: ParentImage/ParentCommandLine map to ECS process.parent.*', function () {
+    var e = { _raw: SAMPLE_SYSMON_1_MIMIKATZ };
+    applyToEvent(e);
+    assert.strictEqual(e.process.parent.executable, 'C:\\Windows\\System32\\cmd.exe');
+    assert.strictEqual(e.process.parent.name, 'cmd.exe');
+    assert.strictEqual(e.process.parent.command_line, 'cmd.exe /c mimikatz.exe');
+    assert.strictEqual(e.process.parent.pid, 4820);
+  });
+
+  test('Sysmon 1: "DOMAIN\\user" splits into ECS user.domain + user.name', function () {
+    var e = { _raw: SAMPLE_SYSMON_1_MIMIKATZ };
+    applyToEvent(e);
+    assert.strictEqual(e.user.domain, 'CORP');
+    assert.strictEqual(e.user.name, 'attacker');
+  });
+
+  test('Sysmon 1: Hashes CSV splits into process.hash.* and pe.imphash', function () {
+    var e = { _raw: SAMPLE_SYSMON_1_MIMIKATZ };
+    applyToEvent(e);
+    assert.strictEqual(e.process.hash.md5, 'D6395FA4C4ABC4A284744C04BC2C6207');
+    assert.strictEqual(e.process.hash.sha256, '69D6A3AB75BCB21819F7D54E69E6BA2CB32C8E958F27473FD54099ADEB4BB353');
+    assert.strictEqual(e.process.pe.imphash, 'D775FDE08B202AEDA21B2DF864344D45');
+    assert.strictEqual(e.process.hash.imphash, undefined, 'imphash belongs under pe, not hash');
+  });
+
+  test('Sysmon 1: OriginalFileName "-" is dropped, not indexed as a literal "-"', function () {
+    var e = { _raw: SAMPLE_SYSMON_1_MIMIKATZ };
+    applyToEvent(e);
+    assert.strictEqual(e.process.pe.original_file_name, undefined);
+    // ...but a real OriginalFileName IS mapped (the rename-evasion signal).
+    var e2 = { _raw: SAMPLE_SYSMON_1_ENCODED_PS };
+    applyToEvent(e2);
+    assert.strictEqual(e2.process.pe.original_file_name, 'PowerShell.EXE');
+  });
+
+  test('Sysmon 1: the 388-char -enc payload survives mapping intact (P3)', function () {
+    var e = { _raw: SAMPLE_SYSMON_1_ENCODED_PS };
+    applyToEvent(e);
+    assert.strictEqual(e.process.command_line, ENC_PAYLOAD);
+    assert.ok(e.process.command_line.length > 256, 'payload must exceed the 256-char ignore_above that was silently dropping it');
+  });
+
+  test('Sysmon 1: event.category/event.type use ECS allowed_values', function () {
+    var e = { _raw: SAMPLE_SYSMON_1_MIMIKATZ };
+    applyToEvent(e);
+    assert.deepStrictEqual(e.event.category, ['process']);
+    assert.deepStrictEqual(e.event.type, ['start']);
+    assert.strictEqual(e.event.code, '1');
+  });
+
+  test('Sysmon 3: network connection maps source/destination/network.transport', function () {
+    var e = { _raw: SAMPLE_SYSMON_3 };
+    applyToEvent(e);
+    assert.strictEqual(e.source.ip, '10.0.10.50');
+    assert.strictEqual(e.source.port, 49865);
+    assert.strictEqual(e.destination.ip, '10.0.1.10');
+    assert.strictEqual(e.destination.port, 88);
+    assert.strictEqual(e.destination.domain, 'SRV-DC-01.corp.example.com');
+    assert.strictEqual(e.network.transport, 'udp');
+    assert.strictEqual(e.process.name, 'lsass.exe');
+    assert.deepStrictEqual(e.event.category, ['network']);
+  });
+
+  test('Sysmon 11: TargetFilename maps to file.path/name/directory', function () {
+    var e = { _raw: SAMPLE_SYSMON_11 };
+    applyToEvent(e);
+    assert.strictEqual(e.file.path, 'C:\\Windows\\Temp\\MSI45070.tmp');
+    assert.strictEqual(e.file.name, 'MSI45070.tmp');
+    assert.strictEqual(e.file.directory, 'C:\\Windows\\Temp');
+    assert.strictEqual(e.process.name, 'KB5034441_update.exe');
+    assert.deepStrictEqual(e.event.category, ['file']);
+    assert.deepStrictEqual(e.event.type, ['creation']);
+  });
+
+  test('EID 1 from a NON-Sysmon provider is not mapped as a process creation', function () {
+    var e = { _raw: SAMPLE_SYSTEM_EID1 };
+    applyToEvent(e);
+    assert.strictEqual(e.process, undefined, 'System-channel EID 1 must not become process.*');
+    assert.strictEqual(e.event.category, undefined);
+    assert.strictEqual(e.event.code, '1', 'but it is still a real event with a code');
+  });
+
+  test('Sysmon: winlog.event_data.* is still preserved alongside ECS', function () {
+    var e = { _raw: SAMPLE_SYSMON_1_MIMIKATZ };
+    applyToEvent(e);
+    assert.strictEqual(e.winlog.event_data.Image, 'C:\\Windows\\Temp\\mimikatz.exe');
+    assert.strictEqual(e.winlog.event_data.User, 'CORP\\attacker');
+    assert.strictEqual(e.winlog.event_id, 1);
   });
 
   console.log('');
