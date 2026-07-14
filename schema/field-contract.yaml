@@ -1,0 +1,103 @@
+# Machine-readable field contract for forge-windows-ecs*.
+#
+# This is the source of truth for "what type is field X" -- SCHEMA.md's
+# prose tables describe the same fields for human readers, but dac-sync's
+# preflight check (internal/preflight) reads *this* file, not SCHEMA.md.
+# Keep them in sync by hand when you change one; nothing parses the markdown
+# tables (that was tried and rejected -- see the Phase 6 note in CHANGES.md).
+#
+# Format: field name -> expected Elasticsearch type, as reported by
+# GET <index>/_field_caps?fields=<field> (the "type" key under fields.<name>).
+#
+# A field referenced by a rule's query that isn't listed here still gets its
+# existence/mapped-but-empty/cross-index-conflict checks -- it just skips the
+# type-match check, since there's nothing to compare against.
+#
+# IMPORTANT: _field_caps reports FAMILY types, not the literal mapping type,
+# for ECS's dual-typed fields -- confirmed empirically (GET .../_mapping vs
+# GET .../_field_caps on the same field disagree):
+#   - a "wildcard"-mapped field (e.g. process.command_line) reports as "keyword"
+#   - a "match_only_text"-mapped field (e.g. process.command_line.text)
+#     reports as "text"
+# This contract lists the _field_caps family type, since that's what
+# internal/preflight actually compares against. Don't "fix" these to match
+# the index template's raw mapping type -- that was tried and made the
+# preflight check fail against a perfectly correct mapping.
+
+fields:
+  "@timestamp": date
+  ecs.version: keyword
+
+  event.code: keyword
+  event.provider: keyword
+  event.kind: keyword
+  event.category: keyword
+  event.type: keyword
+  event.outcome: keyword
+  event.action: keyword
+  event.dataset: keyword
+  event.module: keyword
+
+  host.name: keyword
+  host.hostname: keyword
+  host.ip: ip
+  host.type: keyword
+  host.os.name: keyword
+  host.os.type: keyword
+  host.os.family: keyword
+  host.os.version: keyword
+  host.os.platform: keyword
+
+  asset.owner: keyword
+
+  process.pid: long
+  process.entity_id: keyword
+  process.name: keyword
+  process.executable: keyword
+  process.command_line: keyword # mapped as wildcard; field_caps reports the keyword family type
+  process.command_line.text: text # mapped as match_only_text; field_caps reports the text family type
+  process.working_directory: keyword
+  process.args: keyword
+  process.hash.md5: keyword
+  process.hash.sha1: keyword
+  process.hash.sha256: keyword
+  process.pe.original_file_name: keyword
+  process.pe.product: keyword
+  process.pe.company: keyword
+  process.pe.file_version: keyword
+  process.pe.description: keyword
+  process.pe.imphash: keyword
+  process.parent.pid: long
+  process.parent.entity_id: keyword
+  process.parent.name: keyword
+  process.parent.executable: keyword
+  process.parent.command_line: keyword # mapped as wildcard; field_caps reports the keyword family type
+  process.parent.args: keyword
+
+  file.path: keyword
+  file.name: keyword
+  file.directory: keyword
+
+  user.name: keyword
+  user.domain: keyword
+  user.id: keyword
+
+  source.ip: ip
+  source.port: long
+  destination.ip: ip
+  destination.port: long
+  destination.domain: keyword
+  destination.address: keyword
+
+  network.transport: keyword
+  network.protocol: keyword
+  network.direction: keyword
+  network.type: keyword
+
+  winlog.event_id: long
+  winlog.channel: keyword
+  winlog.computer_name: keyword
+  winlog.record_id: keyword
+  winlog.logon.type: keyword
+
+  log.file.path: keyword

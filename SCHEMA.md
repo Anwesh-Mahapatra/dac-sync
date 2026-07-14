@@ -1,5 +1,12 @@
 # Detection field contract
 
+**Machine-readable source of truth:** `schema/field-contract.yaml`.
+`dac-sync`'s preflight check (`internal/preflight`) validates every rule's
+query against that file and the live `_field_caps` output before syncing --
+this document is the human-readable explanation of the same contract, kept
+in sync by hand. If the two disagree, `schema/field-contract.yaml` is what
+actually gets enforced.
+
 This document is the authority for **which fields a detection rule may query**.
 The rule of thumb: **the live index mapping decides what is queryable; ECS decides
 what a field is named and typed.** A field name being defined in ECS does *not*

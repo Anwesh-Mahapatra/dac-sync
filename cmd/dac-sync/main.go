@@ -10,7 +10,9 @@ import (
 	"syscall"
 	"time"
 
+	"dac-sync/internal/elastic"
 	"dac-sync/internal/kibana"
+	"dac-sync/internal/preflight"
 	"dac-sync/internal/rule"
 	"dac-sync/internal/syncer"
 )
@@ -28,6 +30,21 @@ func main() {
 		dryRun   = flag.Bool("dry-run", false, "print planned actions, mutate nothing")
 		timeout  = flag.Duration("timeout", 30*time.Second, "per-request timeout")
 		insecure = flag.Bool("insecure", false, "skip TLS verification (self-signed lab certs only)")
+
+		elasticURL = flag.String("elastic", envOr("ELASTIC_URL", "http://localhost:9200"),
+			"Elasticsearch base URL, used for preflight field-mapping checks")
+		elasticUser = flag.String("elastic-user", envOr("ELASTIC_USER", "elastic"),
+			"Elasticsearch basic auth user (or env ELASTIC_USER)")
+		elasticPass = flag.String("elastic-pass", os.Getenv("ELASTIC_PASSWORD"),
+			"Elasticsearch basic auth password (or env ELASTIC_PASSWORD)")
+		contractPath = flag.String("field-contract", "./schema/field-contract.yaml",
+			"path to the field-type contract preflight validates rules against")
+		doPreflight = flag.Bool("preflight", true,
+			"validate each rule's referenced fields against the live Elasticsearch mapping before syncing")
+		preflightStrict = flag.Bool("preflight-strict", false,
+			"also fail preflight on a mapped-but-never-populated field (not just warn)")
+		skipPreflight = flag.Bool("skip-preflight", false,
+			"disable preflight entirely (equivalent to -preflight=false)")
 	)
 	flag.Parse()
 
@@ -45,10 +62,23 @@ func main() {
 
 	client := kibana.New(*kibanaURL, *user, *pass, *timeout, *insecure)
 
+	var pf *syncer.PreflightConfig
+	if *doPreflight && !*skipPreflight {
+		if *elasticPass == "" {
+			logger.Fatal("preflight is enabled but missing Elasticsearch credentials: set ELASTIC_PASSWORD or -elastic-pass (or pass -skip-preflight)")
+		}
+		contract, err := preflight.LoadContract(*contractPath)
+		if err != nil {
+			logger.Fatalf("load field contract: %v", err)
+		}
+		esClient := elastic.New(*elasticURL, *elasticUser, *elasticPass, *timeout, *insecure)
+		pf = &syncer.PreflightConfig{Client: esClient, Contract: contract, Strict: *preflightStrict}
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	summary := syncer.Run(ctx, client, rules, *dryRun, logger)
+	summary := syncer.Run(ctx, client, rules, *dryRun, pf, logger)
 
 	suffix := ""
 	if *dryRun {

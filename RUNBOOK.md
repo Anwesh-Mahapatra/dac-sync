@@ -156,10 +156,21 @@ curl -s -u "elastic:$ELASTIC_PW" http://localhost:9200/forge-windows-ecs/_count
 
 ## Check the rule
 
+`-dry-run` and a real sync both run **preflight** first by default: every
+rule's query is scanned for referenced fields, which are then resolved
+against the live `_field_caps` for the rule's `index:` patterns. A field
+that's unmapped, type-mismatched against `schema/field-contract.yaml`, or
+conflicting in type across index patterns aborts the run before anything is
+written to Kibana. A field that's mapped but never populated (an empty index,
+or a field only Sysmon would set) is a warning unless you pass
+`-preflight-strict`. Preflight needs an Elasticsearch credential in addition
+to the Kibana one (same `elastic` user in this lab) -- pass `-elastic-pass`,
+or skip it entirely with `-skip-preflight` if ES isn't reachable.
+
 ```bash
 ELASTIC_PW=$(grep ELASTIC_PASSWORD .env | cut -d= -f2)
-./dac-sync -kibana http://localhost:5601 -user elastic -pass "$ELASTIC_PW" -rules ./rules -dry-run
-./dac-sync -kibana http://localhost:5601 -user elastic -pass "$ELASTIC_PW" -rules ./rules
+./dac-sync -kibana http://localhost:5601 -user elastic -pass "$ELASTIC_PW" -elastic-pass "$ELASTIC_PW" -rules ./rules -dry-run
+./dac-sync -kibana http://localhost:5601 -user elastic -pass "$ELASTIC_PW" -elastic-pass "$ELASTIC_PW" -rules ./rules
 ```
 
 ### Triggering the rule against historical data
@@ -174,7 +185,7 @@ historical data is:
 ```bash
 # 1. Temporarily widen the window
 sed -i 's/from: now-6m/from: now-24h/' rules/example-encoded-powershell.yml
-./dac-sync -kibana http://localhost:5601 -user elastic -pass "$ELASTIC_PW" -rules ./rules
+./dac-sync -kibana http://localhost:5601 -user elastic -pass "$ELASTIC_PW" -elastic-pass "$ELASTIC_PW" -rules ./rules
 
 # 2. Wait for the next scheduled execution (up to 5 min), or check
 curl -s -u "elastic:$ELASTIC_PW" \
@@ -192,7 +203,7 @@ curl -s -u "elastic:$ELASTIC_PW" -X GET \
 
 # 4. Revert
 sed -i 's/from: now-24h/from: now-6m/' rules/example-encoded-powershell.yml
-./dac-sync -kibana http://localhost:5601 -user elastic -pass "$ELASTIC_PW" -rules ./rules
+./dac-sync -kibana http://localhost:5601 -user elastic -pass "$ELASTIC_PW" -elastic-pass "$ELASTIC_PW" -rules ./rules
 ```
 
 ### Diff against GROUND_TRUTH.md
