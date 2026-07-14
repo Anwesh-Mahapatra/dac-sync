@@ -1,0 +1,7 @@
+host.name,host.hostname,host.ip,host.os.name,host.os.type,host.os.family,host.type,asset.owner
+WS-ANALYST-01,WS-ANALYST-01,10.0.10.50,Windows 10,windows,windows,workstation,jsmith
+WS-ANALYST-01.corp.example.com,WS-ANALYST-01,10.0.10.50,Windows 10,windows,windows,workstation,jsmith
+WS-EXEC-01,WS-EXEC-01,10.0.10.100,Windows 11,windows,windows,workstation,mjones
+WS-EXEC-01.corp.example.com,WS-EXEC-01,10.0.10.100,Windows 11,windows,windows,workstation,mjones
+SRV-DC-01,SRV-DC-01,10.0.1.10,Windows Server 2019,windows,windows,domain_controller,
+SRV-DC-01.corp.example.com,SRV-DC-01,10.0.1.10,Windows Server 2019,windows,windows,domain_controller,

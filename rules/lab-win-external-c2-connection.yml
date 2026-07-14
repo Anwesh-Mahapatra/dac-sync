@@ -1,0 +1,45 @@
+# Acceptance test for the 5156 (Windows Filtering Platform) -> ECS mapping
+# added in cribl/winxml_to_ecs.js (Phase 1) -- this rule is only writable
+# because destination.ip/network.* now exist and are populated on forge-*.
+#
+# Field contract: see SCHEMA.md / schema/field-contract.yaml. event.category,
+# event.type, destination.ip all verified present and populated via
+# _field_caps/_count against the live forge-windows-ecs index (dac-sync
+# -preflight enforces this on every sync, not just once by hand).
+#
+# Deliberately does NOT filter on process.name. The obvious design would gate
+# on process.name: "powershell.exe" to tie the connection back to the earlier
+# encoded-PowerShell launch, but the real EvidenceForge data for this
+# scenario's 5156 events (both evt-003 -> 198.51.100.10:443 and evt-006 ->
+# 198.51.100.20:443) shows Application=svchost.exe, not powershell.exe --
+# EvidenceForge doesn't correlate the WFP connection event back to the
+# process that triggered it. A process.name filter would make this rule
+# never fire on real data; hardcoding svchost.exe would be exactly the kind
+# of answer-key overfitting that not hardcoding the destination IP is meant
+# to avoid. Proving the 5156 mapping and destination.ip population is the
+# whole point of this rule, so that's what it's scoped to.
+rule_id: lab-win-external-c2-connection
+name: "Network Connection to External Non-RFC1918 Address"
+description: >-
+  Detects an outbound network connection (Windows Filtering Platform event
+  5156) to a destination address outside the private IPv4 ranges (RFC 1918)
+  and loopback. In this lab environment all legitimate destinations are
+  internal (10.0.0.0/8); a connection outside that range is either the
+  synthetic C2/exfil traffic in the EvidenceForge scenario or genuinely
+  unexpected egress.
+type: query
+language: kuery
+index:
+  - "forge-windows-ecs*"
+query: >-
+  event.category: "network" and event.type: "connection" and
+  not destination.ip: (10.0.0.0/8 or 172.16.0.0/12 or 192.168.0.0/16 or 127.0.0.0/8)
+risk_score: 73
+severity: high
+enabled: true
+interval: 5m
+from: now-6m
+tags:
+  - lab
+  - windows
+  - command-and-control

@@ -22,11 +22,19 @@ All Cribl config that matters is checked into `cribl/`:
 - `cribl/winxml_to_ecs.js` — the parser, **tested standalone with `node cribl/winxml_to_ecs.js`**
 - `cribl/forge_win_ecs.pipeline.json` — generated from `winxml_to_ecs.js` (see below), not hand-written
 - `cribl/forge-windows-ecs.index-template.json` — ES index template (created once, before first ingest)
+- `cribl/generate-assets-lookup.js` / `cribl/lookups/forge-assets.csv` — asset enrichment lookup,
+  generated from `eforge/attack.yaml`; wired into the pipeline as a Lookup function
+- `cribl/outputs/forge_windows_ecs.json` — the Elasticsearch destination config, credentials
+  redacted (`auth.password` is a placeholder — the real value lives only in the running Cribl
+  instance / `.env`, never in git). Load it with the `curl` commands below after substituting the
+  real password. Its `systemFields` is deliberately `[]`: this destination used to leak `cribl_pipe`
+  into every indexed document (and briefly `cribl_breaker` too, from a config edit that predated
+  this file's existence) — see `CHANGES.md`.
 
-The Filesystem Collector, Route, and Elasticsearch destination are **not**
-checked into git (they don't need code review the way the parser does, and
-the destination config carries credentials) — recreate them with the `curl`
-commands below if the Cribl volume is ever wiped.
+The Filesystem Collector and Route are **not** checked into git (they don't
+need code review the way the parser does, and have no equivalent "generate
+from source of truth" step) — recreate them with the `curl` commands below
+if the Cribl volume is ever wiped.
 
 ## One-time setup (already done, here for reference)
 
@@ -43,6 +51,20 @@ curl -s -u "elastic:$ELASTIC_PW" -X PUT http://localhost:9200/_index_template/fo
 # 3. docker-compose.yaml already bind-mounts ./eforge/output/data:/data/eforge:ro
 #    into the cribl service. If it's ever removed, re-add and:
 docker compose up -d --no-deps cribl
+
+# 4. Elasticsearch destination -- load from git, substituting the real password
+#    (cribl/outputs/forge_windows_ecs.json has a placeholder, never the real value)
+ELASTIC_PW=$(grep ELASTIC_PASSWORD .env | cut -d= -f2)
+CRIBL_TOKEN=$(curl -s -X POST http://localhost:9000/api/v1/auth/login \
+  -H 'Content-Type: application/json' -d '{"username":"admin","password":"<cribl admin password>"}' \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])")
+python3 -c "
+import json
+d = json.load(open('cribl/outputs/forge_windows_ecs.json'))
+d['auth']['password'] = '$ELASTIC_PW'
+print(json.dumps(d))
+" | curl -s -X PATCH "http://localhost:9000/api/v1/system/outputs/forge_windows_ecs" \
+  -H "Authorization: Bearer $CRIBL_TOKEN" -H 'Content-Type: application/json' --data-binary @-
 ```
 
 ## Regenerate the scenario
@@ -134,10 +156,21 @@ curl -s -u "elastic:$ELASTIC_PW" http://localhost:9200/forge-windows-ecs/_count
 
 ## Check the rule
 
+`-dry-run` and a real sync both run **preflight** first by default: every
+rule's query is scanned for referenced fields, which are then resolved
+against the live `_field_caps` for the rule's `index:` patterns. A field
+that's unmapped, type-mismatched against `schema/field-contract.yaml`, or
+conflicting in type across index patterns aborts the run before anything is
+written to Kibana. A field that's mapped but never populated (an empty index,
+or a field only Sysmon would set) is a warning unless you pass
+`-preflight-strict`. Preflight needs an Elasticsearch credential in addition
+to the Kibana one (same `elastic` user in this lab) -- pass `-elastic-pass`,
+or skip it entirely with `-skip-preflight` if ES isn't reachable.
+
 ```bash
 ELASTIC_PW=$(grep ELASTIC_PASSWORD .env | cut -d= -f2)
-./dac-sync -kibana http://localhost:5601 -user elastic -pass "$ELASTIC_PW" -rules ./rules -dry-run
-./dac-sync -kibana http://localhost:5601 -user elastic -pass "$ELASTIC_PW" -rules ./rules
+./dac-sync -kibana http://localhost:5601 -user elastic -pass "$ELASTIC_PW" -elastic-pass "$ELASTIC_PW" -rules ./rules -dry-run
+./dac-sync -kibana http://localhost:5601 -user elastic -pass "$ELASTIC_PW" -elastic-pass "$ELASTIC_PW" -rules ./rules
 ```
 
 ### Triggering the rule against historical data
@@ -152,7 +185,7 @@ historical data is:
 ```bash
 # 1. Temporarily widen the window
 sed -i 's/from: now-6m/from: now-24h/' rules/example-encoded-powershell.yml
-./dac-sync -kibana http://localhost:5601 -user elastic -pass "$ELASTIC_PW" -rules ./rules
+./dac-sync -kibana http://localhost:5601 -user elastic -pass "$ELASTIC_PW" -elastic-pass "$ELASTIC_PW" -rules ./rules
 
 # 2. Wait for the next scheduled execution (up to 5 min), or check
 curl -s -u "elastic:$ELASTIC_PW" \
@@ -170,7 +203,7 @@ curl -s -u "elastic:$ELASTIC_PW" -X GET \
 
 # 4. Revert
 sed -i 's/from: now-24h/from: now-6m/' rules/example-encoded-powershell.yml
-./dac-sync -kibana http://localhost:5601 -user elastic -pass "$ELASTIC_PW" -rules ./rules
+./dac-sync -kibana http://localhost:5601 -user elastic -pass "$ELASTIC_PW" -elastic-pass "$ELASTIC_PW" -rules ./rules
 ```
 
 ### Diff against GROUND_TRUTH.md

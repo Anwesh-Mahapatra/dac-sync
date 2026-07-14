@@ -4,7 +4,10 @@
   "template": {
     "settings": {
       "number_of_shards": 1,
-      "number_of_replicas": 0
+      "number_of_replicas": 0,
+      "mapping": {
+        "total_fields": { "limit": 2000 }
+      }
     },
     "mappings": {
       "dynamic_templates": [
@@ -64,13 +67,34 @@
             "kind": { "type": "keyword", "ignore_above": 1024 },
             "category": { "type": "keyword", "ignore_above": 1024 },
             "type": { "type": "keyword", "ignore_above": 1024 },
-            "outcome": { "type": "keyword", "ignore_above": 1024 }
+            "outcome": { "type": "keyword", "ignore_above": 1024 },
+            "action": { "type": "keyword", "ignore_above": 1024 },
+            "dataset": { "type": "keyword", "ignore_above": 1024 },
+            "module": { "type": "keyword", "ignore_above": 1024 }
           }
         },
 
         "host": {
           "properties": {
-            "name": { "type": "keyword", "ignore_above": 1024 }
+            "name": { "type": "keyword", "ignore_above": 1024 },
+            "hostname": { "type": "keyword", "ignore_above": 1024 },
+            "ip": { "type": "ip" },
+            "type": { "type": "keyword", "ignore_above": 1024 },
+            "os": {
+              "properties": {
+                "name": { "type": "keyword", "ignore_above": 1024 },
+                "type": { "type": "keyword", "ignore_above": 1024 },
+                "family": { "type": "keyword", "ignore_above": 1024 },
+                "version": { "type": "keyword", "ignore_above": 1024 },
+                "platform": { "type": "keyword", "ignore_above": 1024 }
+              }
+            }
+          }
+        },
+
+        "asset": {
+          "properties": {
+            "owner": { "type": "keyword", "ignore_above": 1024 }
           }
         },
 
@@ -178,7 +202,9 @@
         "network": {
           "properties": {
             "transport": { "type": "keyword", "ignore_above": 1024 },
-            "protocol": { "type": "keyword", "ignore_above": 1024 }
+            "protocol": { "type": "keyword", "ignore_above": 1024 },
+            "direction": { "type": "keyword", "ignore_above": 1024 },
+            "type": { "type": "keyword", "ignore_above": 1024 }
           }
         },
 

@@ -121,3 +121,86 @@ user), and the fixes target that path.
   ops step (documented in `cribl/README.md`).
 - A **real** `dac-sync` sync (removing `-dry-run`) is held per the guardrails
   until you approve pushing the updated rule to Kibana.
+
+---
+
+# Round 2 — schema drift & ECS coverage gaps (this session, branch `fix/schema-hardening`)
+
+A second review produced six claims about drift between the template, the live
+index, and the pipeline. Phase 0 verified each against the live cluster before
+any edits; two turned out subtly wrong, and a new critical bug was found that
+wasn't on the list at all: **the one live rule (`lab-win-encoded-powershell`)
+had not actually been able to fire since its ECS rewrite** — it queries
+`process.command_line.text`, and the live index (built from a stale,
+intermediate version of the template, edited *after* the index was created)
+only had `process.command_line.keyword`. The 9 alerts already sitting in the
+alerts index all predated the rewrite commit.
+
+## Phase 0 findings
+
+| # | Claim | Verdict |
+|---|---|---|
+| 1 | Live index never got the current template's `dynamic_templates`; truncates at 256 | Confirmed the drift (index built from a stale template version — `modified_date_millis` was *after* the index's `creation_date`), but the truncation point was 32766, not 256 — a third, intermediate template version, not ES's default. Also found `process.command_line` itself (not just `winlog.event_data.*`) was on the stale shape, which is what broke the live rule. |
+| 2 | No `case '5156'`/`'4689'` in the parser | Confirmed. 5156 alone was 51% of doc volume. |
+| 3 | `event.kind/action/dataset/module`, `host.ip`, `host.os.*` absent from every doc | Confirmed. |
+| 4 | Pipeline sets `host` as a scalar string; something outside the repo nests it into `{name:...}` | Confirmed the pipeline never reshapes it (byte-diffed deployed vs. git); could not fully attribute the live-observed nesting to any inspectable Cribl config. Made moot by owning the shape explicitly in code. |
+| 5 | Sysmon not yet in the scenario; adding it risks a double-fire on the encoded-PS rule | Confirmed, not yet exercised — deferred (Sysmon ingestion is out of scope for this pass; `alert_suppression` added regardless as a defensive measure). |
+| 6 | `cribl_pipe`/`cribl_breaker` leak into `_source`, destination-injected | Confirmed present, but the mechanism was split: `cribl_pipe` was destination `systemFields`-controlled (fixed there); `cribl_breaker` persisted through clearing `systemFields`, disabling the breaker ruleset's `shouldMarkCriblBreaker`, *and* a full worker restart — its actual source in the Filesystem Collector's collection-job code path couldn't be pinned down via the API. Fixed by stripping both explicitly in the pipeline's `eval` function instead of relying on either upstream setting. |
+
+Also found: the rule query used in Phase 7a's spec (`process.name: "powershell.exe"` gating the C2 rule) doesn't match real data — both C2 connections' 5156 events show `Application=svchost.exe` (EvidenceForge doesn't correlate the WFP connection event to the earlier PowerShell process). Dropped that clause; the rule instead proves the 5156 mapping via `event.category`/`event.type`/external `destination.ip` alone.
+
+## Phase 1 — `cribl/winxml_to_ecs.js`
+
+- Universal fields on every event: `event.kind: 'event'`, `event.module: 'windows'`, `event.dataset` (per-channel map with a `windows.other` fallback).
+- `host` changed from a scalar string to `{name, hostname, os: {}}`; `__e.asset = {}` also pre-created (see Phase 3 — this turned out to be load-bearing for the Lookup function, not just a style choice).
+- New `case '5156'`/`'5157'` (Windows Filtering Platform) and `case '4689'` (process exit), field names verified against real `eforge/output/` XML — `ProcessID` (capital D) vs. 4688/4689's `ProcessId`, numeric `Protocol`, `%%14592`/`%%14593` `Direction` codes, and device-path `Application` all confirmed from actual samples, not assumed from docs.
+- 15 new tests (32 total). No 5157 sample exists anywhere in this scenario's real output (confirmed via grep); that branch is exercised via the real 5156 fixture with the EventID substituted, documented inline rather than fabricating an `<Event>` block.
+- **Bug found only at deploy time, not by the local test suite**: `generate-pipeline.js`'s `HELPERS` list wasn't updated for the 5 new helper functions, so the deployed Cribl Code function threw `ReferenceError` on every event and silently dropped all 2955 collected events (0 reached ES). The local `node winxml_to_ecs.js` run couldn't catch this because every top-level function in that file shares scope with every other one there — that blind spot is exactly what the file's own header comment claims doesn't exist. Fixed the immediate bug (added the helpers to `HELPERS`, made `eventDataset` self-contained instead of closing over a module-level object) and closed the blind spot itself: `generate-pipeline.js` now runs the *exact* generated string through `new Function()` against one synthetic event per switch-case branch before ever writing the file, so a missing helper fails `node generate-pipeline.js` instead of a live Cribl worker.
+- Also renamed a local var from `proto` to `transportProto` — Cribl's Code function validator rejects `proto` as a prototype-pollution guard, again only surfacing at actual deploy time.
+
+## Phase 2 — index template + `SCHEMA.md`
+
+- Added `event.action/dataset/module`, `host.hostname/ip/type/os.*`, `asset.owner`, `network.direction/type`; bumped `total_fields.limit` to 2000.
+- `winlog.event_id: long` decision documented, including that `winlogbeat-*` doesn't exist on this cluster so the cross-index conflict the template guards against is currently unverifiable (not fabricated).
+
+## Phase 3 — asset enrichment
+
+- `cribl/generate-assets-lookup.js` (no YAML dependency — a small targeted parser for `attack.yaml`'s specific `users`/`systems` list shape) emits `cribl/lookups/forge-assets.csv`, keyed on both the short hostname and FQDN.
+- `assigned_user` → `asset.owner`, never `user.name` (the attack's premise is `attacker` acting as `jsmith`; overwriting the real actor would falsify attribution).
+- **Second Cribl quirk found empirically**: the Lookup function can set a property on an object that already exists, but will not auto-create a missing intermediate object along a dotted output path — an `outFields` entry targeting a brand-new nested path (`host.os.name`, `asset.owner`) silently wrote nothing, while one targeting a new direct property of an already-existing object (`host.osname`) worked. Confirmed by testing each `outFields` entry in isolation via live replays. Fixed by pre-creating `host.os = {}` and `__e.asset = {}` in the Code function (Phase 1) so their parents exist before the Lookup function runs.
+
+## Phase 4 — Cribl destination
+
+- `forge_windows_ecs` destination's `systemFields` was `["cribl_pipe"]` despite the live index having both `cribl_pipe` *and* `cribl_breaker` on every doc — the config had been tightened at some point after the existing documents were ingested (same "edited after the fact" pattern as the template). Set to `[]`.
+- Destination config now version-controlled at `cribl/outputs/forge_windows_ecs.json` (credentials redacted — a placeholder string, never the real value).
+
+## Phase 5 — index rebuild
+
+- Snapshotted `_count` (1955) and the `event.code` distribution before any destructive operation.
+- PUT the updated template, deleted and recreated `forge-windows-ecs`, replayed via the Filesystem Collector Full Run job API.
+- First replay attempt sent 0 documents (the `ReferenceError` bug above). After fixing `generate-pipeline.js` and redeploying, replay landed all 1955 docs with the identical `event.code` distribution as the pre-rebuild snapshot.
+- `cribl_breaker` required the `eval`-function strip described above; everything else (mappings, `destination.ip` on 995 docs, `event.kind`/`host.os.type` on all 1955, `asset.owner` on 693) verified via `_field_caps`/`_count` post-replay.
+
+## Phase 6 — `dac-sync` preflight
+
+- New `internal/elastic` (talks to ES directly; `internal/kibana` only talks to the Detection Engine API), `internal/preflight` (KQL field extractor + contract/mapping/population checks), `schema/field-contract.yaml` (the enforced source of truth — SCHEMA.md points to it, not the reverse; parsing SCHEMA.md's markdown tables was considered and rejected).
+- `syncer.Run` now preflights every rule before any Kibana write; a failure aborts the whole run. New flags: `-preflight` (default on), `-preflight-strict`, `-skip-preflight`, `-elastic*`.
+- `scripts/check-pipeline-drift.sh` + `Makefile`: diffs the Cribl-deployed pipeline against git (`node generate-pipeline.js --check` alone only proves the generator matches git, not that git matches what's deployed).
+- **Real finding**: `_field_caps` reports *family* types, not the literal mapping type, for ECS's dual-typed fields — `wildcard` (`process.command_line`) reports as `keyword`; `match_only_text` (`process.command_line.text`) reports as `text`. Confirmed the raw mapping was correct (`_mapping` showed `wildcard`/`match_only_text` as intended) before fixing the contract to match what `_field_caps` actually returns.
+- Verified live: default mode passes with a warning on `process.pe.original_file_name` (mapped, genuinely unpopulated — Sysmon isn't ingested yet); a rule pointed at a bogus field name fails naming that field; `-preflight-strict` fails on the same mapped-but-empty field that only warns by default.
+
+## Phase 7 — suppression + two new rules
+
+- `alert_suppression` added to `lab-win-encoded-powershell` (`group_by: [host.name, process.command_line]`, 5m, `missing_fields_strategy: suppress`) ahead of adding Sysmon, which would otherwise double-fire it (claim #5). Verified the exact schema against the live Kibana 9.4.3 Detection Engine API directly before committing it to the rule file — no Go code changes were needed (`rule.Rule.Payload` is already a generic `map[string]any` marshaled wholesale; the original brief's assumption that `internal/rule` and the Kibana client needed extending was wrong).
+- `lab-win-external-c2-connection`: proves the 5156 mapping and `destination.ip` population. Deliberately drops the `process.name: "powershell.exe"` clause from the brief's design — real 5156 data for both C2 connections in this scenario shows `Application=svchost.exe` (EvidenceForge doesn't correlate the WFP event back to the triggering process); keeping that clause would make the rule permanently un-fireable, and hardcoding `svchost.exe` would be exactly the answer-key overfitting the brief warned against for the destination IP.
+- `lab-win-dc-logon-from-workstation`: proves the asset-enrichment lookup (`host.type: domain_controller`). Confirmed alerting on evt-007, but the rule as specified is noisy in this dataset — 78 total matches, because EvidenceForge's baseline/background activity generator produces routine type-3 logons from workstations to the DC (ordinary AD authentication traffic, not inherently suspicious). Shipped as specified since the acceptance bar was "alerts on evt-007," not precision, but a real deployment would need additional narrowing (e.g. excluding known-good service accounts, or correlating with the C2/exfil chain) before this would be usable as a low-noise detection.
+- **Both new rules' triggering against historical scenario data required `from: now-3d`, not the `now-24h` the existing RUNBOOK section documents** — the scenario's timestamps (2026-07-13) are now more than 24h behind wall-clock time as the branch has spanned multiple days. Not a rule bug; the RUNBOOK's historical-trigger technique is time-sensitive to when it's run relative to when the scenario was generated.
+
+## Deviations from the six-claim brief
+
+- Claim 1's specific truncation number (256) was wrong; the real number was 32766, and the drift also hit `process.command_line`, not just `winlog.event_data.*` — which is what had silently broken the one existing rule.
+- Claim 4's mechanism couldn't be fully attributed (no access to Cribl's server-side source); the fix (own the shape explicitly) doesn't depend on knowing the mechanism.
+- Claim 6's `cribl_breaker` fix required a different mechanism than the brief assumed (destination System Fields) — see above.
+- The Phase 7a C2 rule design in the original brief (`process.name: "powershell.exe"`) doesn't match real EvidenceForge data for this scenario; the clause was dropped.
+- The Phase 7a brief assumed Go changes were needed for `alert_suppression`; they weren't.
+- The Phase 7b DC-logon rule fires correctly but is noisier than the brief implied — documented above rather than silently shipped.

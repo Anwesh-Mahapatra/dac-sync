@@ -1,0 +1,41 @@
+# Acceptance test for the asset-enrichment lookup added in Phase 3
+# (cribl/generate-assets-lookup.js + cribl/lookups/forge-assets.csv) -- this
+# rule is only writable because host.type: "domain_controller" now exists on
+# forge-* docs. Without that lookup, no rule can distinguish a DC from a
+# workstation at all.
+#
+# Field contract: see SCHEMA.md / schema/field-contract.yaml. host.type,
+# event.code, winlog.logon.type, source.ip all verified present via
+# _field_caps against the live forge-windows-ecs index.
+#
+# 10.0.10.0/24 is the workstation subnet in eforge/attack.yaml
+# (environment.systems: WS-ANALYST-01 10.0.10.50, WS-EXEC-01 10.0.10.100);
+# SRV-DC-01 is 10.0.1.10, a different subnet. evt-007 in
+# eforge/output/GROUND_TRUTH.md is a network logon (logon_type 3) to
+# SRV-DC-01 from 10.0.10.100 (WS-EXEC-01) -- lateral movement from a
+# compromised workstation to the domain controller.
+rule_id: lab-win-dc-logon-from-workstation
+name: "Network Logon to Domain Controller from Workstation Subnet"
+description: >-
+  Detects a network logon (event 4624, logon type 3) to a host known to be a
+  domain controller (via the asset lookup) originating from an IP in the
+  workstation subnet. Domain controllers are normally administered from
+  dedicated jump hosts or the DC console itself, not directly from end-user
+  workstations -- this is the lateral-movement step in the lab's
+  credential-stuffing scenario.
+type: query
+language: kuery
+index:
+  - "forge-windows-ecs*"
+query: >-
+  host.type: "domain_controller" and event.code: "4624" and
+  winlog.logon.type: "3" and source.ip: 10.0.10.0/24
+risk_score: 73
+severity: high
+enabled: true
+interval: 5m
+from: now-6m
+tags:
+  - lab
+  - windows
+  - lateral-movement

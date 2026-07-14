@@ -39,6 +39,20 @@ severity: medium
 enabled: true
 interval: 5m
 from: now-6m
+# Sysmon isn't in eforge/attack.yaml's output.logs yet (SCHEMA.md / CHANGES.md
+# Phase 0 claim #5), but adding it later would make a single encoded-PowerShell
+# launch emit both a 4688 and a Sysmon EID 1 -- both normalizing to the same
+# event.category/type/process.name/command_line, so this rule would fire
+# twice on one attacker action. Suppress now, before that's possible, rather
+# than reactively once it double-fires.
+alert_suppression:
+  group_by:
+    - host.name
+    - process.command_line
+  duration:
+    value: 5
+    unit: m
+  missing_fields_strategy: suppress
 tags:
   - lab
   - windows
