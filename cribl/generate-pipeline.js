@@ -31,7 +31,12 @@ var HELPERS = [
   m.parseHashes,
   m.sysmonProcess,
   m.splitArgs,
-  m.extractEventData
+  m.extractEventData,
+  m.validAddr,
+  m.networkDirection,
+  m.ianaProtoName,
+  m.normalizeDevicePath,
+  m.eventDataset
 ];
 
 function bodyOf(fn) {
@@ -48,6 +53,51 @@ function buildCode() {
   return parts.join('\n\n') + '\n';
 }
 
+// Cribl runs the Code function in a sandbox that only has HELPERS + the
+// applyToEvent body in scope -- nothing else from winxml_to_ecs.js. Running
+// `node winxml_to_ecs.js` alone does NOT prove the sandboxed version works,
+// because every top-level function in that file is in scope of every other
+// one there. This previously shipped a real bug: a helper (eventDataset)
+// closed over a module-level var (EVENT_DATASET_BY_CHANNEL) that never made
+// it into HELPERS, so the code ran fine in-file but threw
+// "ReferenceError: EVENT_DATASET_BY_CHANNEL is not defined" the moment it
+// was actually deployed to Cribl -- silently dropping every event. Smoke-test
+// the *exact* generated string, in isolation, against one minimal event per
+// switch-case branch, so a missing helper fails `node generate-pipeline.js`
+// instead of a live Cribl worker.
+function smokeTest(code) {
+  var fn;
+  try {
+    fn = new Function('__e', code);
+  } catch (e) {
+    throw new Error('generated code has a syntax error: ' + e.message);
+  }
+
+  var caseIds = [];
+  var re = /case '(\d+)':/g;
+  var m2;
+  var body = bodyOf(m.applyToEvent);
+  while ((m2 = re.exec(body)) !== null) {
+    if (caseIds.indexOf(m2[1]) < 0) caseIds.push(m2[1]);
+  }
+
+  var sysmonIds = { '1': 1, '3': 1, '11': 1 };
+  caseIds.forEach(function (id) {
+    var provider = sysmonIds[id] ? 'Microsoft-Windows-Sysmon' : 'Microsoft-Windows-Security-Auditing';
+    var raw = '<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">' +
+      '<System><Provider Name="' + provider + '"/><EventID>' + id + '</EventID>' +
+      '<TimeCreated SystemTime="2026-01-01T00:00:00.0000000Z"/><EventRecordID>1</EventRecordID>' +
+      '<Channel>Security</Channel><Computer>HOST.example.com</Computer></System>' +
+      '<EventData></EventData></Event>';
+    var e = { _raw: raw };
+    try {
+      fn(e);
+    } catch (err) {
+      throw new Error('EventID ' + id + ' threw when run through the exact generated (sandboxed) code: ' + err.message);
+    }
+  });
+}
+
 function main() {
   var check = process.argv.indexOf('--check') !== -1;
   var pipeline = JSON.parse(fs.readFileSync(PIPELINE, 'utf8'));
@@ -56,6 +106,8 @@ function main() {
   if (!codeFn) throw new Error('no "code" function in ' + PIPELINE);
 
   var next = buildCode();
+  smokeTest(next);
+
   if (codeFn.conf.code === next) {
     console.log('forge_win_ecs.pipeline.json is up to date with winxml_to_ecs.js');
     return;

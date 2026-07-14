@@ -79,14 +79,17 @@ function normalizeDevicePath(p) {
 }
 
 // event.dataset per winlog.channel. Fallback covers channels we don't have a
-// specific mapping for yet.
-var EVENT_DATASET_BY_CHANNEL = {
-  'Security': 'windows.security',
-  'Microsoft-Windows-Sysmon/Operational': 'windows.sysmon_operational',
-  'System': 'windows.system'
-};
+// specific mapping for yet. Deliberately self-contained (no module-level
+// object) -- generate-pipeline.js embeds helpers into Cribl's sandboxed Code
+// function via Function.prototype.toString(), which only captures the
+// function body, not free variables it closes over.
 function eventDataset(channel) {
-  return EVENT_DATASET_BY_CHANNEL[channel] || 'windows.other';
+  switch (channel) {
+    case 'Security': return 'windows.security';
+    case 'Microsoft-Windows-Sysmon/Operational': return 'windows.sysmon_operational';
+    case 'System': return 'windows.system';
+    default: return 'windows.other';
+  }
 }
 
 // Tokenizes a Windows command line into an argv-style array, treating a run
@@ -231,7 +234,17 @@ function applyToEvent(__e) {
   if (providerMatch) __e.event.provider = providerMatch[1];
 
   if (computerMatch) {
-    __e.host = { name: computerMatch[1], hostname: computerMatch[1].split('.')[0] };
+    // host.os and __e.asset are pre-created empty here, not by the Lookup
+    // function later in the pipeline: Cribl's Lookup function can only set a
+    // property on an object that already exists at the parent path -- it
+    // does not auto-vivify missing intermediate objects the way a plain `a.b.c
+    // = x` assignment would. Verified empirically: an outFields entry
+    // targeting a brand-new nested path (host.os.name, asset.owner) silently
+    // writes nothing, while one targeting a new direct property of an
+    // already-existing object (host.osname) works. So the parents have to
+    // exist before the Lookup function runs.
+    __e.host = { name: computerMatch[1], hostname: computerMatch[1].split('.')[0], os: {} };
+    __e.asset = {};
   }
 
   __e.winlog = __e.winlog || {};
