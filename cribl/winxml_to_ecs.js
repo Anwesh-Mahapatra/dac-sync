@@ -439,8 +439,8 @@ function applyToEvent(__e) {
         if (!isNaN(wfpDstPort)) __e.destination.port = wfpDstPort;
       }
 
-      var proto = ianaProtoName(eventData.Protocol);
-      if (proto) __e.network = { transport: proto };
+      var transportProto = ianaProtoName(eventData.Protocol);
+      if (transportProto) __e.network = { transport: transportProto };
       var direction = networkDirection(eventData.Direction);
       if (direction) {
         __e.network = __e.network || {};
