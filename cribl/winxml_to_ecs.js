@@ -287,8 +287,10 @@ function applyToEvent(__e) {
           __e.destination = __e.destination || {};
           __e.destination.domain = dstHost;
         }
-        var proto = sysmonVal(eventData.Protocol);
-        if (proto) __e.network = { transport: proto.toLowerCase() };
+        var transportProtocol = sysmonVal(eventData.Protocol);
+        if (transportProtocol) {
+          __e.network = { transport: transportProtocol.toLowerCase() };
+      }     
 
         __e.event.category = ['network'];
         __e.event.type = ['connection'];
