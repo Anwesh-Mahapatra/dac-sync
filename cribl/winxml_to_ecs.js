@@ -36,6 +36,59 @@ function stripIpv4Mapped(ip) {
   return ip.replace(/^::ffff:/i, '');
 }
 
+// 5156/5157 addresses can legitimately be "-" (no address) or a literal "::"
+// (unspecified IPv6) -- neither is a real address worth indexing as `ip`.
+function validAddr(v) {
+  return !!v && v !== '-' && v !== '::';
+}
+
+// 5156/5157 Direction is a Windows "resource string" code, not a plain word.
+// Accept the raw %% codes we've actually observed, and the literal words too
+// in case a future EvidenceForge version writes them out directly.
+function networkDirection(v) {
+  if (!v) return undefined;
+  if (v === '%%14592') return 'inbound';
+  if (v === '%%14593') return 'outbound';
+  var lower = v.toLowerCase();
+  if (lower === 'inbound' || lower === 'outbound') return lower;
+  return undefined;
+}
+
+// 5156/5157 Protocol is a numeric IANA protocol number (e.g. "6", "17"), not
+// the lowercase word Sysmon 3 gives you -- do NOT .toLowerCase() this.
+function ianaProtoName(v) {
+  if (v == null) return undefined;
+  switch (parseInt(v, 10)) {
+    case 1: return 'icmp';
+    case 6: return 'tcp';
+    case 17: return 'udp';
+    case 58: return 'ipv6-icmp';
+    default: return v;
+  }
+}
+
+// 5156/5157 Application is a device path (\device\harddiskvolumeN\...), which
+// won't join against 4688's drive-letter process.executable unless normalized.
+// ASSUMPTION: volume 1 = C: -- this lab has one disk. Any other volume number
+// is left unnormalized (still indexed, just not join-able with 4688).
+function normalizeDevicePath(p) {
+  if (!p) return p;
+  var m = /^\\device\\harddiskvolume(\d+)\\(.*)$/i.exec(p);
+  if (!m || m[1] !== '1') return p;
+  return 'C:\\' + m[2];
+}
+
+// event.dataset per winlog.channel. Fallback covers channels we don't have a
+// specific mapping for yet.
+var EVENT_DATASET_BY_CHANNEL = {
+  'Security': 'windows.security',
+  'Microsoft-Windows-Sysmon/Operational': 'windows.sysmon_operational',
+  'System': 'windows.system'
+};
+function eventDataset(channel) {
+  return EVENT_DATASET_BY_CHANNEL[channel] || 'windows.other';
+}
+
 // Tokenizes a Windows command line into an argv-style array, treating a run
 // of characters wrapped in matching '"' or "'" as one token (quotes of the
 // other kind are kept literal inside), same as a simple shell-style split.
@@ -172,9 +225,14 @@ function applyToEvent(__e) {
 
   __e.event = __e.event || {};
   __e.event.code = eventId;
+  __e.event.kind = 'event';
+  __e.event.module = 'windows';
+  __e.event.dataset = eventDataset(channelMatch ? channelMatch[1] : undefined);
   if (providerMatch) __e.event.provider = providerMatch[1];
 
-  if (computerMatch) __e.host = computerMatch[1];
+  if (computerMatch) {
+    __e.host = { name: computerMatch[1], hostname: computerMatch[1].split('.')[0] };
+  }
 
   __e.winlog = __e.winlog || {};
   __e.winlog.event_id = parseInt(eventId, 10);
@@ -366,6 +424,67 @@ function applyToEvent(__e) {
       }
       break;
     }
+    case '5156': // Windows Filtering Platform: connection allowed
+    case '5157': { // Windows Filtering Platform: connection blocked
+      var allowed = (eventId === '5156');
+
+      if (validAddr(eventData.SourceAddress)) {
+        __e.source = { ip: stripIpv4Mapped(eventData.SourceAddress) };
+        var wfpSrcPort = parseInt(eventData.SourcePort, 10);
+        if (!isNaN(wfpSrcPort)) __e.source.port = wfpSrcPort;
+      }
+      if (validAddr(eventData.DestAddress)) {
+        __e.destination = { ip: stripIpv4Mapped(eventData.DestAddress) };
+        var wfpDstPort = parseInt(eventData.DestPort, 10);
+        if (!isNaN(wfpDstPort)) __e.destination.port = wfpDstPort;
+      }
+
+      var proto = ianaProtoName(eventData.Protocol);
+      if (proto) __e.network = { transport: proto };
+      var direction = networkDirection(eventData.Direction);
+      if (direction) {
+        __e.network = __e.network || {};
+        __e.network.direction = direction;
+      }
+
+      if (eventData.Application) {
+        var appPath = normalizeDevicePath(eventData.Application);
+        __e.process = {
+          executable: appPath,
+          name: basename(appPath)
+        };
+        var wfpPid = hexToDecimal(eventData.ProcessID);
+        if (wfpPid !== undefined) __e.process.pid = wfpPid;
+      }
+
+      __e.event.category = ['network'];
+      __e.event.type = allowed ? ['connection', 'allowed'] : ['connection', 'denied'];
+      __e.event.outcome = allowed ? 'success' : 'failure';
+      break;
+    }
+    case '4689': { // process exit
+      var exitProc = {};
+      if (eventData.ProcessName) {
+        exitProc.executable = eventData.ProcessName;
+        exitProc.name = basename(eventData.ProcessName);
+      }
+      var exitPid = hexToDecimal(eventData.ProcessId);
+      if (exitPid !== undefined) exitProc.pid = exitPid;
+      __e.process = exitProc;
+
+      __e.user = {
+        name: eventData.SubjectUserName,
+        domain: eventData.SubjectDomainName,
+        id: eventData.SubjectUserSid
+      };
+
+      if (eventData.Status) {
+        __e.event.outcome = (eventData.Status === '0x0') ? 'success' : 'failure';
+      }
+      __e.event.category = ['process'];
+      __e.event.type = ['end'];
+      break;
+    }
     case '4648': { // explicit credential logon -- lateral movement
       __e.user = {
         name: eventData.TargetUserName,
@@ -402,7 +521,12 @@ module.exports = {
   sysmonVal: sysmonVal,
   splitDomainUser: splitDomainUser,
   parseHashes: parseHashes,
-  sysmonProcess: sysmonProcess
+  sysmonProcess: sysmonProcess,
+  validAddr: validAddr,
+  networkDirection: networkDirection,
+  ianaProtoName: ianaProtoName,
+  normalizeDevicePath: normalizeDevicePath,
+  eventDataset: eventDataset
 };
 
 if (require.main === module) {
@@ -557,6 +681,144 @@ if (require.main === module) {
     '  </EventData>\n' +
     '</Event>\n';
 
+  // Verbatim from eforge/output/data/WS-ANALYST-01.corp.example.com/windows_event_security.xml
+  // -- a routine 5156 with Application="System" (PID 4, the kernel), an
+  // internal destination. No 5157 sample exists anywhere in real
+  // EvidenceForge output for this scenario (grep confirms zero), so per the
+  // "never invent a fixture" rule there is no dedicated 5157 XML test --
+  // 5157 shares the 5156 code path end-to-end except for the
+  // allowed/denied branch, which is covered by unit-testing networkDirection
+  // and the allowed/outcome ternary logic directly below.
+  var SAMPLE_5156_INTERNAL =
+    '<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">\n' +
+    '  <System>\n' +
+    '    \n' +
+    '    <Provider Name="Microsoft-Windows-Security-Auditing" Guid="{54849625-5478-4994-a5ba-3e3b0328c30d}"/>\n' +
+    '    \n' +
+    '    <EventID>5156</EventID>\n' +
+    '    <Version>1</Version>\n' +
+    '    <Level>0</Level>\n' +
+    '    <Task>12810</Task>\n' +
+    '    <Opcode>0</Opcode>\n' +
+    '    <Keywords>0x8020000000000000</Keywords>\n' +
+    '    <TimeCreated SystemTime="2026-07-13T04:53:23.5940705Z"/>\n' +
+    '    <EventRecordID>348484</EventRecordID>\n' +
+    '    <Correlation/>\n' +
+    '    <Execution ProcessID="4" ThreadID="164"/>\n' +
+    '    <Channel>Security</Channel>\n' +
+    '    <Computer>WS-ANALYST-01.corp.example.com</Computer>\n' +
+    '    \n' +
+    '    <Security/>\n' +
+    '    \n' +
+    '  </System>\n' +
+    '  \n' +
+    '  <EventData>\n' +
+    '    \n' +
+    '    <Data Name="ProcessID">4</Data>\n' +
+    '    <Data Name="Application">System</Data>\n' +
+    '    <Data Name="Direction">%%14593</Data>\n' +
+    '    <Data Name="SourceAddress">10.0.10.50</Data>\n' +
+    '    <Data Name="SourcePort">64063</Data>\n' +
+    '    <Data Name="DestAddress">10.0.1.10</Data>\n' +
+    '    <Data Name="DestPort">445</Data>\n' +
+    '    <Data Name="Protocol">6</Data>\n' +
+    '    <Data Name="FilterRTID">23582</Data>\n' +
+    '    <Data Name="LayerName">%%14611</Data>\n' +
+    '    <Data Name="LayerRTID">48</Data>\n' +
+    '    <Data Name="RemoteUserID">S-1-0-0</Data>\n' +
+    '    <Data Name="RemoteMachineID">S-1-0-0</Data>\n' +
+    '    \n' +
+    '  </EventData>\n' +
+    '  \n' +
+    '</Event>\n';
+
+  // Verbatim -- evt-003, the actual C2 connection (198.51.100.10:443) from
+  // GROUND_TRUTH.md. Application is a device path (svchost.exe, PID 3744) --
+  // EvidenceForge does not correlate this event to the earlier powershell.exe
+  // process, so process.name here is genuinely svchost.exe, not powershell.exe.
+  var SAMPLE_5156_C2 =
+    '<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">\n' +
+    '  <System>\n' +
+    '    \n' +
+    '    <Provider Name="Microsoft-Windows-Security-Auditing" Guid="{54849625-5478-4994-a5ba-3e3b0328c30d}"/>\n' +
+    '    \n' +
+    '    <EventID>5156</EventID>\n' +
+    '    <Version>1</Version>\n' +
+    '    <Level>0</Level>\n' +
+    '    <Task>12810</Task>\n' +
+    '    <Opcode>0</Opcode>\n' +
+    '    <Keywords>0x8020000000000000</Keywords>\n' +
+    '    <TimeCreated SystemTime="2026-07-13T05:15:45.0775307Z"/>\n' +
+    '    <EventRecordID>350093</EventRecordID>\n' +
+    '    <Correlation/>\n' +
+    '    <Execution ProcessID="4" ThreadID="132"/>\n' +
+    '    <Channel>Security</Channel>\n' +
+    '    <Computer>WS-ANALYST-01.corp.example.com</Computer>\n' +
+    '    \n' +
+    '    <Security/>\n' +
+    '    \n' +
+    '  </System>\n' +
+    '  \n' +
+    '  <EventData>\n' +
+    '    \n' +
+    '    <Data Name="ProcessID">3744</Data>\n' +
+    '    <Data Name="Application">\\device\\harddiskvolume1\\windows\\system32\\svchost.exe</Data>\n' +
+    '    <Data Name="Direction">%%14593</Data>\n' +
+    '    <Data Name="SourceAddress">10.0.10.50</Data>\n' +
+    '    <Data Name="SourcePort">59813</Data>\n' +
+    '    <Data Name="DestAddress">198.51.100.10</Data>\n' +
+    '    <Data Name="DestPort">443</Data>\n' +
+    '    <Data Name="Protocol">6</Data>\n' +
+    '    <Data Name="FilterRTID">23599</Data>\n' +
+    '    <Data Name="LayerName">%%14611</Data>\n' +
+    '    <Data Name="LayerRTID">48</Data>\n' +
+    '    <Data Name="RemoteUserID">S-1-0-0</Data>\n' +
+    '    <Data Name="RemoteMachineID">S-1-0-0</Data>\n' +
+    '    \n' +
+    '  </EventData>\n' +
+    '  \n' +
+    '</Event>\n';
+
+  // Verbatim from the same file -- a routine 4689 process exit (SYSTEM
+  // reaping wsqmcons.exe), one of the 126 in this dataset the pipeline
+  // previously mapped zero ECS for.
+  var SAMPLE_4689 =
+    '<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">\n' +
+    '  <System>\n' +
+    '    \n' +
+    '    <Provider Name="Microsoft-Windows-Security-Auditing" Guid="{54849625-5478-4994-a5ba-3e3b0328c30d}"/>\n' +
+    '    \n' +
+    '    <EventID>4689</EventID>\n' +
+    '    <Version>0</Version>\n' +
+    '    <Level>0</Level>\n' +
+    '    <Task>13313</Task>\n' +
+    '    <Opcode>0</Opcode>\n' +
+    '    <Keywords>0x8020000000000000</Keywords>\n' +
+    '    <TimeCreated SystemTime="2026-07-13T05:01:31.3076357Z"/>\n' +
+    '    <EventRecordID>349730</EventRecordID>\n' +
+    '    <Correlation/>\n' +
+    '    <Execution ProcessID="4" ThreadID="340"/>\n' +
+    '    <Channel>Security</Channel>\n' +
+    '    <Computer>WS-ANALYST-01.corp.example.com</Computer>\n' +
+    '    \n' +
+    '    <Security/>\n' +
+    '    \n' +
+    '  </System>\n' +
+    '  \n' +
+    '  <EventData>\n' +
+    '    \n' +
+    '    <Data Name="SubjectUserSid">S-1-5-18</Data>\n' +
+    '    <Data Name="SubjectUserName">SYSTEM</Data>\n' +
+    '    <Data Name="SubjectDomainName">NT AUTHORITY</Data>\n' +
+    '    <Data Name="SubjectLogonId">0x3e7</Data>\n' +
+    '    <Data Name="Status">0x0</Data>\n' +
+    '    <Data Name="ProcessId">0x1494</Data>\n' +
+    '    <Data Name="ProcessName">C:\\Windows\\System32\\wsqmcons.exe</Data>\n' +
+    '    \n' +
+    '  </EventData>\n' +
+    '  \n' +
+    '</Event>\n';
+
   // A wrapper chunk like the drop function is meant to kill: the file
   // preamble before the first <Event> match.
   var SAMPLE_WRAPPER = '<?xml version="1.0" encoding="utf-8"?>\n<Events>\n';
@@ -640,6 +902,111 @@ if (require.main === module) {
     assert.strictEqual(e.destination.domain, 'CORP');
     assert.strictEqual(e.destination.address, 'WS-EXEC-01.corp.example.com');
     assert.strictEqual(e.source.ip, '10.0.10.50');
+  });
+
+  test('host.name is set as an ECS object, not a scalar string', function () {
+    var e = { _raw: SAMPLE_4624 };
+    applyToEvent(e);
+    assert.strictEqual(typeof e.host, 'object');
+    assert.strictEqual(e.host.name, 'WS-ANALYST-01.corp.example.com');
+    assert.strictEqual(e.host.hostname, 'WS-ANALYST-01', 'host.hostname is the short (first-label) name');
+  });
+
+  test('event.kind/module/dataset are set on every event type (Security channel)', function () {
+    var e = { _raw: SAMPLE_4624 };
+    applyToEvent(e);
+    assert.strictEqual(e.event.kind, 'event');
+    assert.strictEqual(e.event.module, 'windows');
+    assert.strictEqual(e.event.dataset, 'windows.security');
+  });
+
+  test('5156 (internal dest, Application="System"): network mapping, process, direction, protocol', function () {
+    var e = { _raw: SAMPLE_5156_INTERNAL };
+    applyToEvent(e);
+    assert.strictEqual(e.event.code, '5156');
+    assert.deepStrictEqual(e.event.category, ['network']);
+    assert.deepStrictEqual(e.event.type, ['connection', 'allowed']);
+    assert.strictEqual(e.event.outcome, 'success');
+    assert.strictEqual(e.source.ip, '10.0.10.50');
+    assert.strictEqual(e.source.port, 64063);
+    assert.strictEqual(e.destination.ip, '10.0.1.10');
+    assert.strictEqual(e.destination.port, 445);
+    assert.strictEqual(e.network.transport, 'tcp', 'Protocol "6" is an IANA number, must resolve to tcp not "6"');
+    assert.strictEqual(e.network.direction, 'outbound', '%%14593 is the outbound resource code');
+    assert.strictEqual(e.process.executable, 'System', 'a bare device-less Application value passes through unchanged');
+    assert.strictEqual(e.process.name, 'System');
+    assert.strictEqual(e.process.pid, 4, 'ProcessID (capital D) decodes via hexToDecimal same as decimal 4');
+  });
+
+  test('5156 external C2 connection (evt-003, 198.51.100.10:443): destination.ip is queryable, device path normalized', function () {
+    var e = { _raw: SAMPLE_5156_C2 };
+    applyToEvent(e);
+    assert.strictEqual(e.destination.ip, '198.51.100.10');
+    assert.strictEqual(e.destination.port, 443);
+    assert.strictEqual(e.network.transport, 'tcp');
+    assert.strictEqual(e.process.executable, 'C:\\windows\\system32\\svchost.exe', 'harddiskvolume1 normalizes to C: per the documented volume-1 assumption');
+    assert.strictEqual(e.process.name, 'svchost.exe');
+    assert.strictEqual(e.process.pid, 3744);
+  });
+
+  test('5156/5157 address guard: "-" and "::" must not set destination.ip/source.ip (mirrors the 4624/4625 IpAddress guard)', function () {
+    assert.strictEqual(validAddr('-'), false);
+    assert.strictEqual(validAddr('::'), false);
+    assert.strictEqual(validAddr(''), false);
+    assert.strictEqual(validAddr(undefined), false);
+    assert.strictEqual(validAddr('198.51.100.10'), true);
+
+    var e = { _raw: SAMPLE_5156_C2.replace('<Data Name="SourceAddress">10.0.10.50</Data>', '<Data Name="SourceAddress">-</Data>') };
+    applyToEvent(e);
+    assert.strictEqual(e.source, undefined, '"-" source address must not become a bogus source.ip');
+    assert.strictEqual(e.destination.ip, '198.51.100.10', 'destination is unaffected by the source guard');
+  });
+
+  test('5157 shares the 5156 code path but flips to denied/failure (no real 5157 sample exists in EvidenceForge output for this scenario -- verified by grep -- so this exercises the code path via the real 5156 fixture with EventID substituted, not a fabricated event)', function () {
+    var e = { _raw: SAMPLE_5156_INTERNAL.replace('<EventID>5156</EventID>', '<EventID>5157</EventID>') };
+    applyToEvent(e);
+    assert.strictEqual(e.event.code, '5157');
+    assert.deepStrictEqual(e.event.type, ['connection', 'denied']);
+    assert.strictEqual(e.event.outcome, 'failure');
+    assert.strictEqual(e.destination.ip, '10.0.1.10', 'address mapping is identical to 5156');
+  });
+
+  test('ianaProtoName: numeric IANA protocol numbers resolve to names, not lowercased Sysmon-style strings', function () {
+    assert.strictEqual(ianaProtoName('6'), 'tcp');
+    assert.strictEqual(ianaProtoName('17'), 'udp');
+    assert.strictEqual(ianaProtoName('1'), 'icmp');
+    assert.strictEqual(ianaProtoName('58'), 'ipv6-icmp');
+    assert.strictEqual(ianaProtoName('999'), '999', 'unknown protocol numbers pass through rather than being dropped');
+  });
+
+  test('networkDirection: accepts the %% resource codes and literal words', function () {
+    assert.strictEqual(networkDirection('%%14592'), 'inbound');
+    assert.strictEqual(networkDirection('%%14593'), 'outbound');
+    assert.strictEqual(networkDirection('inbound'), 'inbound');
+    assert.strictEqual(networkDirection('Outbound'), 'outbound');
+    assert.strictEqual(networkDirection('%%99999'), undefined);
+  });
+
+  test('normalizeDevicePath: volume 1 maps to C:, other volumes pass through unchanged', function () {
+    assert.strictEqual(normalizeDevicePath('\\device\\harddiskvolume1\\windows\\system32\\svchost.exe'), 'C:\\windows\\system32\\svchost.exe');
+    assert.strictEqual(normalizeDevicePath('\\device\\harddiskvolume2\\data\\file.exe'), '\\device\\harddiskvolume2\\data\\file.exe', 'no assumption is made for non-1 volumes');
+    assert.strictEqual(normalizeDevicePath('System'), 'System', 'non-device-path values pass through unchanged');
+  });
+
+  test('4689 process exit: process/user/outcome mapped, event.category=[process] event.type=[end]', function () {
+    var e = { _raw: SAMPLE_4689 };
+    applyToEvent(e);
+    assert.strictEqual(e.event.code, '4689');
+    assert.deepStrictEqual(e.event.category, ['process']);
+    assert.deepStrictEqual(e.event.type, ['end']);
+    assert.strictEqual(e.event.outcome, 'success', 'Status 0x0 maps to success');
+    assert.strictEqual(e.process.pid, 0x1494);
+    assert.strictEqual(e.process.pid, 5268);
+    assert.strictEqual(e.process.executable, 'C:\\Windows\\System32\\wsqmcons.exe');
+    assert.strictEqual(e.process.name, 'wsqmcons.exe');
+    assert.strictEqual(e.user.name, 'SYSTEM');
+    assert.strictEqual(e.user.domain, 'NT AUTHORITY');
+    assert.strictEqual(e.user.id, 'S-1-5-18');
   });
 
   test('wrapper chunk (no <Event>) is left untouched -- caller is expected to drop it', function () {
@@ -793,6 +1160,12 @@ if (require.main === module) {
     assert.deepStrictEqual(e.event.category, ['process']);
     assert.deepStrictEqual(e.event.type, ['start']);
     assert.strictEqual(e.event.code, '1');
+  });
+
+  test('event.dataset maps the Sysmon channel to windows.sysmon_operational', function () {
+    var e = { _raw: SAMPLE_SYSMON_1_MIMIKATZ };
+    applyToEvent(e);
+    assert.strictEqual(e.event.dataset, 'windows.sysmon_operational');
   });
 
   test('Sysmon 3: network connection maps source/destination/network.transport', function () {
