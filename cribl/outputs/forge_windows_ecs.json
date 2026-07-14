@@ -1,0 +1,106 @@
+{
+  "id": "forge_windows_ecs",
+  "type": "elastic",
+  "index": "'forge-windows-ecs'",
+  "urls": [
+    {
+      "weight": 1,
+      "url": "http://elasticsearch:9200/_bulk"
+    }
+  ],
+  "auth": {
+    "disabled": false,
+    "authType": "manual",
+    "username": "elastic",
+    "password": "REDACTED -- set via Cribl UI/API from $ELASTIC_PASSWORD, never committed"
+  },
+  "writeAction": "create",
+  "includeDocId": false,
+  "compress": true,
+  "concurrency": 5,
+  "flushPeriodSec": 1,
+  "onBackpressure": "block",
+  "rejectUnauthorized": true,
+  "elasticVersion": "auto",
+  "systemFields": [],
+  "streamtags": [],
+  "loadBalanced": true,
+  "maxPayloadSizeKB": 4096,
+  "maxPayloadEvents": 0,
+  "timeoutSec": 30,
+  "failedRequestLoggingMode": "none",
+  "safeHeaders": [],
+  "responseRetrySettings": [
+    {
+      "httpStatus": 401,
+      "initialBackoff": 1000,
+      "backoffRate": 2,
+      "maxBackoff": 20000
+    },
+    {
+      "httpStatus": 403,
+      "initialBackoff": 1000,
+      "backoffRate": 2,
+      "maxBackoff": 20000
+    },
+    {
+      "httpStatus": 408,
+      "initialBackoff": 250,
+      "backoffRate": 2,
+      "maxBackoff": 10000
+    },
+    {
+      "httpStatus": 429,
+      "initialBackoff": 1000,
+      "backoffRate": 2,
+      "maxBackoff": 10000
+    },
+    {
+      "httpStatus": 500,
+      "initialBackoff": 250,
+      "backoffRate": 2,
+      "maxBackoff": 10000
+    },
+    {
+      "httpStatus": 502,
+      "initialBackoff": 250,
+      "backoffRate": 2,
+      "maxBackoff": 10000
+    },
+    {
+      "httpStatus": 503,
+      "initialBackoff": 250,
+      "backoffRate": 2,
+      "maxBackoff": 10000
+    },
+    {
+      "httpStatus": 504,
+      "initialBackoff": 250,
+      "backoffRate": 2,
+      "maxBackoff": 10000
+    },
+    {
+      "httpStatus": 509,
+      "initialBackoff": 250,
+      "backoffRate": 2,
+      "maxBackoff": 10000
+    }
+  ],
+  "responseHonorRetryAfterHeader": true,
+  "extraParams": [
+    {
+      "name": "filter_path",
+      "value": "errors,items.*.error,items.*._index,items.*.status"
+    }
+  ],
+  "retryPartialErrors": false,
+  "excludeSelf": false,
+  "dnsResolvePeriodSec": 600,
+  "loadBalanceStatsPeriodSec": 300,
+  "timeoutRetrySettings": {
+    "timeoutRetry": true,
+    "initialBackoff": 500,
+    "backoffRate": 2,
+    "maxBackoff": 10000
+  }
+}

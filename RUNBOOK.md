@@ -22,11 +22,19 @@ All Cribl config that matters is checked into `cribl/`:
 - `cribl/winxml_to_ecs.js` — the parser, **tested standalone with `node cribl/winxml_to_ecs.js`**
 - `cribl/forge_win_ecs.pipeline.json` — generated from `winxml_to_ecs.js` (see below), not hand-written
 - `cribl/forge-windows-ecs.index-template.json` — ES index template (created once, before first ingest)
+- `cribl/generate-assets-lookup.js` / `cribl/lookups/forge-assets.csv` — asset enrichment lookup,
+  generated from `eforge/attack.yaml`; wired into the pipeline as a Lookup function
+- `cribl/outputs/forge_windows_ecs.json` — the Elasticsearch destination config, credentials
+  redacted (`auth.password` is a placeholder — the real value lives only in the running Cribl
+  instance / `.env`, never in git). Load it with the `curl` commands below after substituting the
+  real password. Its `systemFields` is deliberately `[]`: this destination used to leak `cribl_pipe`
+  into every indexed document (and briefly `cribl_breaker` too, from a config edit that predated
+  this file's existence) — see `CHANGES.md`.
 
-The Filesystem Collector, Route, and Elasticsearch destination are **not**
-checked into git (they don't need code review the way the parser does, and
-the destination config carries credentials) — recreate them with the `curl`
-commands below if the Cribl volume is ever wiped.
+The Filesystem Collector and Route are **not** checked into git (they don't
+need code review the way the parser does, and have no equivalent "generate
+from source of truth" step) — recreate them with the `curl` commands below
+if the Cribl volume is ever wiped.
 
 ## One-time setup (already done, here for reference)
 
@@ -43,6 +51,20 @@ curl -s -u "elastic:$ELASTIC_PW" -X PUT http://localhost:9200/_index_template/fo
 # 3. docker-compose.yaml already bind-mounts ./eforge/output/data:/data/eforge:ro
 #    into the cribl service. If it's ever removed, re-add and:
 docker compose up -d --no-deps cribl
+
+# 4. Elasticsearch destination -- load from git, substituting the real password
+#    (cribl/outputs/forge_windows_ecs.json has a placeholder, never the real value)
+ELASTIC_PW=$(grep ELASTIC_PASSWORD .env | cut -d= -f2)
+CRIBL_TOKEN=$(curl -s -X POST http://localhost:9000/api/v1/auth/login \
+  -H 'Content-Type: application/json' -d '{"username":"admin","password":"<cribl admin password>"}' \
+  | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])")
+python3 -c "
+import json
+d = json.load(open('cribl/outputs/forge_windows_ecs.json'))
+d['auth']['password'] = '$ELASTIC_PW'
+print(json.dumps(d))
+" | curl -s -X PATCH "http://localhost:9000/api/v1/system/outputs/forge_windows_ecs" \
+  -H "Authorization: Bearer $CRIBL_TOKEN" -H 'Content-Type: application/json' --data-binary @-
 ```
 
 ## Regenerate the scenario
