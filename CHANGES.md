@@ -181,9 +181,26 @@ Also found: the rule query used in Phase 7a's spec (`process.name: "powershell.e
 - First replay attempt sent 0 documents (the `ReferenceError` bug above). After fixing `generate-pipeline.js` and redeploying, replay landed all 1955 docs with the identical `event.code` distribution as the pre-rebuild snapshot.
 - `cribl_breaker` required the `eval`-function strip described above; everything else (mappings, `destination.ip` on 995 docs, `event.kind`/`host.os.type` on all 1955, `asset.owner` on 693) verified via `_field_caps`/`_count` post-replay.
 
+## Phase 6 — `dac-sync` preflight
+
+- New `internal/elastic` (talks to ES directly; `internal/kibana` only talks to the Detection Engine API), `internal/preflight` (KQL field extractor + contract/mapping/population checks), `schema/field-contract.yaml` (the enforced source of truth — SCHEMA.md points to it, not the reverse; parsing SCHEMA.md's markdown tables was considered and rejected).
+- `syncer.Run` now preflights every rule before any Kibana write; a failure aborts the whole run. New flags: `-preflight` (default on), `-preflight-strict`, `-skip-preflight`, `-elastic*`.
+- `scripts/check-pipeline-drift.sh` + `Makefile`: diffs the Cribl-deployed pipeline against git (`node generate-pipeline.js --check` alone only proves the generator matches git, not that git matches what's deployed).
+- **Real finding**: `_field_caps` reports *family* types, not the literal mapping type, for ECS's dual-typed fields — `wildcard` (`process.command_line`) reports as `keyword`; `match_only_text` (`process.command_line.text`) reports as `text`. Confirmed the raw mapping was correct (`_mapping` showed `wildcard`/`match_only_text` as intended) before fixing the contract to match what `_field_caps` actually returns.
+- Verified live: default mode passes with a warning on `process.pe.original_file_name` (mapped, genuinely unpopulated — Sysmon isn't ingested yet); a rule pointed at a bogus field name fails naming that field; `-preflight-strict` fails on the same mapped-but-empty field that only warns by default.
+
+## Phase 7 — suppression + two new rules
+
+- `alert_suppression` added to `lab-win-encoded-powershell` (`group_by: [host.name, process.command_line]`, 5m, `missing_fields_strategy: suppress`) ahead of adding Sysmon, which would otherwise double-fire it (claim #5). Verified the exact schema against the live Kibana 9.4.3 Detection Engine API directly before committing it to the rule file — no Go code changes were needed (`rule.Rule.Payload` is already a generic `map[string]any` marshaled wholesale; the original brief's assumption that `internal/rule` and the Kibana client needed extending was wrong).
+- `lab-win-external-c2-connection`: proves the 5156 mapping and `destination.ip` population. Deliberately drops the `process.name: "powershell.exe"` clause from the brief's design — real 5156 data for both C2 connections in this scenario shows `Application=svchost.exe` (EvidenceForge doesn't correlate the WFP event back to the triggering process); keeping that clause would make the rule permanently un-fireable, and hardcoding `svchost.exe` would be exactly the answer-key overfitting the brief warned against for the destination IP.
+- `lab-win-dc-logon-from-workstation`: proves the asset-enrichment lookup (`host.type: domain_controller`). Confirmed alerting on evt-007, but the rule as specified is noisy in this dataset — 78 total matches, because EvidenceForge's baseline/background activity generator produces routine type-3 logons from workstations to the DC (ordinary AD authentication traffic, not inherently suspicious). Shipped as specified since the acceptance bar was "alerts on evt-007," not precision, but a real deployment would need additional narrowing (e.g. excluding known-good service accounts, or correlating with the C2/exfil chain) before this would be usable as a low-noise detection.
+- **Both new rules' triggering against historical scenario data required `from: now-3d`, not the `now-24h` the existing RUNBOOK section documents** — the scenario's timestamps (2026-07-13) are now more than 24h behind wall-clock time as the branch has spanned multiple days. Not a rule bug; the RUNBOOK's historical-trigger technique is time-sensitive to when it's run relative to when the scenario was generated.
+
 ## Deviations from the six-claim brief
 
 - Claim 1's specific truncation number (256) was wrong; the real number was 32766, and the drift also hit `process.command_line`, not just `winlog.event_data.*` — which is what had silently broken the one existing rule.
 - Claim 4's mechanism couldn't be fully attributed (no access to Cribl's server-side source); the fix (own the shape explicitly) doesn't depend on knowing the mechanism.
 - Claim 6's `cribl_breaker` fix required a different mechanism than the brief assumed (destination System Fields) — see above.
 - The Phase 7a C2 rule design in the original brief (`process.name: "powershell.exe"`) doesn't match real EvidenceForge data for this scenario; the clause was dropped.
+- The Phase 7a brief assumed Go changes were needed for `alert_suppression`; they weren't.
+- The Phase 7b DC-logon rule fires correctly but is noisier than the brief implied — documented above rather than silently shipped.
